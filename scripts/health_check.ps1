@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string]$ProjectRoot = (Resolve-Path "..").Path,
+    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
 
     [Parameter()]
     [int]$MaxAgeMinutes = 1440,
@@ -36,6 +36,10 @@ function Write-Status {
     Write-Host "[$timestamp][$Level] $Message"
 }
 
+function Format-Dt([datetime]$dt) {
+    return $dt.ToString("yyyy-MM-dd HH:mm:ss")
+}
+
 function Get-RecentFilesByPattern {
     param(
         [Parameter(Mandatory)][string]$Dir,
@@ -54,12 +58,11 @@ function Get-RecentFilesByPattern {
 try {
     $dataPath = Join-Path $ProjectRoot "data"
     $threshold = (Get-Date).AddMinutes(-$MaxAgeMinutes)
-    $thresholdText = $threshold.ToString("yyyy-MM-dd HH:mm:ss")
 
     Write-Status "Health check started"
     Write-Status ("Project root: {0}" -f [string]$ProjectRoot)
     Write-Status ("Data path: {0}" -f [string]$dataPath)
-    Write-Status ("MaxAgeMinutes: {0} (threshold: {1})" -f [string]$MaxAgeMinutes, $thresholdText)
+    Write-Status ("MaxAgeMinutes: {0} (threshold: {1})" -f [string]$MaxAgeMinutes, (Format-Dt $threshold))
 
     if (-not (Test-Path -LiteralPath $dataPath)) {
         Write-Status ("Data directory not found: {0}" -f [string]$dataPath) "ERROR"
@@ -83,7 +86,7 @@ try {
 
         if ($VerboseMode) {
             $recentAny | Sort-Object LastWriteTime -Desc | Select-Object -First 50 | ForEach-Object {
-                Write-Host (" - {0} (LastWrite: {1})" -f $_.FullName, $_.LastWriteTime)
+                Write-Host (" - {0} (LastWrite: {1})" -f $_.FullName, (Format-Dt $_.LastWriteTime))
             }
         }
 
@@ -113,7 +116,7 @@ try {
                 if ($null -eq $latest) {
                     Write-Host (" - {0}: (no file)" -f $p)
                 } else {
-                    Write-Host (" - {0}: latest {1} ({2})" -f $p, $latest.LastWriteTime, $latest.Name)
+                    Write-Host (" - {0}: latest {1} ({2})" -f $p, (Format-Dt $latest.LastWriteTime), $latest.Name)
                 }
             }
         }
@@ -125,7 +128,7 @@ try {
 
     if ($VerboseMode) {
         $matches | Select-Object -First 50 | ForEach-Object {
-            Write-Host (" - {0} (LastWrite: {1})" -f $_.FullName, $_.LastWriteTime)
+            Write-Host (" - {0} (LastWrite: {1})" -f $_.FullName, (Format-Dt $_.LastWriteTime))
         }
     }
 
