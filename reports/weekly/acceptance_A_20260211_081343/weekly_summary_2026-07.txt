@@ -1,0 +1,53 @@
+﻿=== Weekly Task Summary ===
+GeneratedAt: 2026-02-11 08:07:47
+IsoWeek: 2026-07
+RootDir: D:\projects\investment-assistant
+SummaryPath: D:\projects\investment-assistant\reports\weekly\weekly_summary_2026-07.txt
+LogPath: D:\projects\investment-assistant\logs\weekly\weekly_task_20260211_080747.log
+
+HealthCheck: OK (listed root items)
+PythonVenv: OK (D:\projects\investment-assistant\.venv\Scripts\python.exe)
+PipInstall: SKIPPED (no requirements.txt)
+Pytest: SKIPPED (pytest not installed)
+MdCheck: OK
+
+=== Data Snapshot ===
+CSV: D:\projects\investment-assistant\data\2330.csv
+  Lines: 741
+  LastWrite: 2026/2/11 上午 05:58:39
+  LastDate: 2026-02-10
+CSV: D:\projects\investment-assistant\data\0050.csv
+  Lines: 741
+  LastWrite: 2026/2/11 上午 05:58:43
+  LastDate: 2026-02-09
+CSV: D:\projects\investment-assistant\data\phase5_signals_2330.csv
+  Lines: 741
+  LastWrite: 2026/2/11 上午 05:58:40
+  LastDate: 2026-02-10
+CSV: D:\projects\investment-assistant\data\phase5_signals_0050.csv
+  Lines: 741
+  LastWrite: 2026/2/11 上午 05:58:44
+  LastDate: 2026-02-09
+CSV: D:\projects\investment-assistant\data\metrics_sweep.csv
+  Lines: 1
+  LastWrite: 2026/2/10 下午 03:33:02
+Phase6EquityCount: 4
+  Equity: phase6_equity_0050_v15.csv | Lines=741 | LastWrite=2026/2/11 上午 05:58:45 | LastDate=2026-02-09
+  Equity: phase6_equity_2330.csv | Lines=488 | LastWrite=2026/2/11 上午 03:08:36 | LastDate=2026-02-10
+  Equity: phase6_equity_2330_v11.csv | Lines=488 | LastWrite=2026/2/11 上午 03:08:36 | LastDate=2026-02-10
+  Equity: phase6_equity_2330_v15.csv | Lines=741 | LastWrite=2026/2/11 上午 05:58:40 | LastDate=2026-02-10
+Phase6TradesCount: 4
+  Trades: phase6_trades_0050_v15.csv | Lines=12 | LastWrite=2026/2/11 上午 05:58:45
+  Trades: phase6_trades_2330.csv | Lines=8 | LastWrite=2026/2/11 上午 03:08:36
+  Trades: phase6_trades_2330_v11.csv | Lines=8 | LastWrite=2026/2/11 上午 03:08:36
+  Trades: phase6_trades_2330_v15.csv | Lines=9 | LastWrite=2026/2/11 上午 05:58:40
+MissingOptionalCount: 0
+DataSnapshot: OK
+
+BootstrapMode: OFF (summaryCount=12, min=2)
+
+GapCheck: OK
+
+WarningsCount: 0
+FailedStepsCount: 0
+ExitCode: 0

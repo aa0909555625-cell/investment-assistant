@@ -1,0 +1,15 @@
+{
+  "asof_date": "2026-02-10",
+  "symbol": "2330",
+  "holding": 1,
+  "shares": 1177,
+  "entry_price": 1465.7325,
+  "stop_level": 1407.1032,
+  "trail_level": 1656.0,
+  "last_close_inferred": 1880.0,
+  "stop_buffer_pct": 0.33607826348486736,
+  "trail_buffer_pct": 0.13526570048309172,
+  "exit_reason_today_last": "nan",
+  "cash": 974.672414,
+  "equity": 2213734.672414
+}

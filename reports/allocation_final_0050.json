@@ -1,0 +1,15 @@
+{
+  "asof_date": "2026-02-09",
+  "symbol": "0050",
+  "holding": 1,
+  "shares": 17251,
+  "entry_price": 62.53125,
+  "stop_level": 60.03,
+  "trail_level": 66.375,
+  "last_close_inferred": 73.95,
+  "stop_buffer_pct": 0.2318840579710144,
+  "trail_buffer_pct": 0.11412429378531086,
+  "exit_reason_today_last": "nan",
+  "cash": 5.440379,
+  "equity": 1275716.890379
+}

@@ -1,0 +1,39 @@
+﻿[2026-02-11 06:18:28] [INFO] Weekly task start. RootDir=D:\projects\investment-assistant
+[2026-02-11 06:18:28] [INFO] LogPath=D:\projects\investment-assistant\logs\weekly\weekly_task_20260211_061828.log
+[2026-02-11 06:18:28] [INFO] SummaryPath=D:\projects\investment-assistant\reports\weekly\weekly_summary_2026-07.txt
+[2026-02-11 06:18:28] [STEP] ==> HealthCheck: list repo root
+[2026-02-11 06:18:28] [INFO] RootItem: .venv
+[2026-02-11 06:18:28] [INFO] RootItem: archive
+[2026-02-11 06:18:28] [INFO] RootItem: data
+[2026-02-11 06:18:28] [INFO] RootItem: logs
+[2026-02-11 06:18:28] [INFO] RootItem: reports
+[2026-02-11 06:18:28] [INFO] RootItem: scripts
+[2026-02-11 06:18:28] [INFO] RootItem: src
+[2026-02-11 06:18:28] [INFO] RootItem: tests
+[2026-02-11 06:18:28] [INFO] RootItem: run.ps1
+[2026-02-11 06:18:28] [INFO] RootItem: _check_md.py
+[2026-02-11 06:18:28] [INFO] RootItem: _patch_note.txt
+[2026-02-11 06:18:28] [INFO] RootItem: _probe_md.py
+[2026-02-11 06:18:28] [INFO] <== OK: HealthCheck: list repo root
+[2026-02-11 06:18:28] [STEP] ==> Python: ensure venv (.venv)
+[2026-02-11 06:18:28] [INFO] Venv OK: D:\projects\investment-assistant\.venv\Scripts\python.exe
+[2026-02-11 06:18:28] [INFO] <== OK: Python: ensure venv (.venv)
+[2026-02-11 06:18:28] [STEP] ==> Python: pip install (requirements.txt if exists)
+[2026-02-11 06:18:28] [WARN] requirements.txt not found; skip pip install
+[2026-02-11 06:18:28] [INFO] <== OK: Python: pip install (requirements.txt if exists)
+[2026-02-11 06:18:28] [STEP] ==> Python: pytest (if installed)
+[2026-02-11 06:18:29] [WARN] pytest not installed; skip
+[2026-02-11 06:18:29] [INFO] <== OK: Python: pytest (if installed)
+[2026-02-11 06:18:29] [STEP] ==> Python: markdown check (_check_md.py if exists)
+[2026-02-11 06:18:29] [INFO] CMD: D:\projects\investment-assistant\.venv\Scripts\python.exe D:\projects\investment-assistant\_check_md.py
+[2026-02-11 06:18:30] [ERROR] <== FAIL: Python: markdown check (_check_md.py if exists) | ExitCode=1
+[2026-02-11 06:18:30] [ERROR] Stack: at Invoke-Exe, D:\projects\investment-assistant\scripts\run_weekly_task.ps1: line 106
+at <ScriptBlock>, D:\projects\investment-assistant\scripts\run_weekly_task.ps1: line 255
+at Run-Step, D:\projects\investment-assistant\scripts\run_weekly_task.ps1: line 86
+at <ScriptBlock>, D:\projects\investment-assistant\scripts\run_weekly_task.ps1: line 268
+[2026-02-11 06:18:30] [WARN] BootstrapMode ON: summaryCount=1 < BootstrapMinSummaries=2 (gap will not set ExitCode=2)
+[2026-02-11 06:18:30] [INFO] GapCheck start (LookbackWeeks=12)...
+[2026-02-11 06:18:30] [WARN] GapCheck: MISSING 11 week(s): 2026-06, 2026-05, 2026-04, 2026-03, 2026-02, 2026-53, 2025-52, 2025-51, 2025-50, 2025-49, 2025-48
+[2026-02-11 06:18:30] [INFO] Weekly task done. ExitCode=1
+[2026-02-11 06:18:30] [INFO] SummaryPath=D:\projects\investment-assistant\reports\weekly\weekly_summary_2026-07.txt
+[2026-02-11 06:18:30] [INFO] LogPath=D:\projects\investment-assistant\logs\weekly\weekly_task_20260211_061828.log

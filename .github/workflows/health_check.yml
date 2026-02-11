@@ -1,0 +1,29 @@
+name: health-check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours (UTC)
+
+jobs:
+  health:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run health check
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "logs\health" | Out-Null
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_health_check.ps1" -MaxAgeMinutes 1440 -VerboseMode
+          "ExitCode=$LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-logs
+          path: logs/health/*.log
+          if-no-files-found: ignore

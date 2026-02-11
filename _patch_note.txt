@@ -1,0 +1,8 @@
+# --- PATCH: fix Portfolio.load signature ---
+# before:
+# portfolio = Portfolio.load(Path(args.portfolio))
+
+portfolio = Portfolio.load(
+    Path(args.portfolio),
+    default_cash=cfg.start_cash,
+)
