@@ -13,3 +13,5 @@ data/
 logs/
 # --- generated weekly report archives (big) ---
 # --- python venv ---
+# --- runtime data / logs (do not commit) ---
+# --- generated reports archives (do not commit) ---

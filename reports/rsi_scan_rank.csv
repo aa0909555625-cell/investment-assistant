@@ -1,4 +1,0 @@
-rsi_period,buy_rsi,sell_rsi,cooldown_bars,trend_mode,sma_fast,sma_slow,trade_count,win_rate_pct,total_return_pct,max_drawdown_pct,sharpe,report,score
-14,50,60,0,both,50,200,10,40.0,31.3,-15.19,1.03,reports/scan_tmp/report_2330_p14_b50_s60_c0_tboth.md,53.251999999999995
-14,50,60,0,sma_cross,50,200,10,40.0,31.3,-15.19,1.03,reports/scan_tmp/report_2330_p14_b50_s60_c0_tsma_cross.md,53.251999999999995
-14,50,60,0,close_above_slow,50,200,10,40.0,31.3,-15.19,1.03,reports/scan_tmp/report_2330_p14_b50_s60_c0_tclose_above_slow.md,53.251999999999995
