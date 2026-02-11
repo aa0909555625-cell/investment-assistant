@@ -1,0 +1,6 @@
+
+# --- generated reports / archives (do not commit) ---
+reports/weekly/archive/
+reports/**/archive/
+*.jsonl
+*.log
