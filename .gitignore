@@ -12,3 +12,4 @@ __pycache__/
 data/
 logs/
 # --- generated weekly report archives (big) ---
+# --- python venv ---
