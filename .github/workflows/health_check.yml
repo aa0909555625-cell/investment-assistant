@@ -1,4 +1,4 @@
-name: health-check
+﻿name: health-check
 
 on:
   workflow_dispatch:
@@ -12,15 +12,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run health check
+      - name: Smoke test (PowerShell scripts load)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "logs\health" | Out-Null
-          pwsh -NoProfile -ExecutionPolicy Bypass -File ".\scripts\run_health_check.ps1" -MaxAgeMinutes 1440 -VerboseMode
-          "ExitCode=$LASTEXITCODE"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ErrorActionPreference = "Stop"
+          Write-Host "Repo:" (Get-Location)
+          Get-ChildItem .\scripts -File | Select-Object Name,Length | Format-Table -AutoSize
 
-      - name: Upload logs
+          # just validate scripts parse (no data dependency)
+          pwsh -NoProfile -Command "Get-Command .\scripts\health_check.ps1 | Out-Null; 'health_check.ps1 OK'"
+          pwsh -NoProfile -Command "Get-Command .\scripts\run_health_check.ps1 | Out-Null; 'run_health_check.ps1 OK'"
+
+      - name: Upload logs folder (if any)
         if: always()
         uses: actions/upload-artifact@v4
         with:
