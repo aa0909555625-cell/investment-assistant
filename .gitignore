@@ -4,3 +4,11 @@ reports/weekly/archive/
 reports/**/archive/
 *.jsonl
 *.log
+# --- python / venv ---
+.venv/
+__pycache__/
+*.pyc
+# --- generated data / logs / reports ---
+data/
+logs/
+# --- generated weekly report archives (big) ---
