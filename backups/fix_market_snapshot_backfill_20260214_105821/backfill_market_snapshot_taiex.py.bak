@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+"""
+Backfill TAIEX daily OHLC from TWSE MI_5MINS_HIST (monthly table) and build market snapshot.
+
+Outputs:
+- data/market_taiex_hist.csv
+- data/market_snapshot_taiex.csv
+
+Snapshot fields:
+date, risk_mode, trend_ok, market_ok, close, change_percent, sma_fast, sma_slow
+
+Note:
+pandas.read_html MUST receive a file-like (StringIO) for raw HTML; otherwise it may treat HTML as a filename.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import re
+from io import StringIO
+from typing import Dict, List, Tuple
+
+import pandas as pd
+import requests
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+OUT_HIST = os.path.join(ROOT, "data", "market_taiex_hist.csv")
+OUT_SNAP = os.path.join(ROOT, "data", "market_snapshot_taiex.csv")
+URL = "https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"
+
+S = requests.Session()
+S.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+})
+
+def ymd(s: str) -> dt.date:
+    return dt.datetime.strptime(s, "%Y-%m-%d").date()
+
+def month_iter(start: dt.date, end: dt.date):
+    cur = dt.date(start.year, start.month, 1)
+    last = dt.date(end.year, end.month, 1)
+    while cur <= last:
+        yield cur.year, cur.month
+        if cur.month == 12:
+            cur = dt.date(cur.year + 1, 1, 1)
+        else:
+            cur = dt.date(cur.year, cur.month + 1, 1)
+
+def roc_to_ad(roc: str) -> str:
+    roc = str(roc).strip()
+    m = re.match(r"^\s*(\d{2,3})/(\d{2})/(\d{2})\s*$", roc)
+    if not m:
+        return ""
+    y = int(m.group(1)) + 1911
+    return f"{y:04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+def to_float(x) -> float:
+    s = str(x).replace(",", "").strip()
+    if s in ("", "--", "---", "nan", "None"):
+        return float("nan")
+    try:
+        return float(s)
+    except Exception:
+        return float("nan")
+
+def fetch_month_table(year: int, month: int, timeout: int) -> pd.DataFrame:
+    date_param = f"{year:04d}{month:02d}01"
+    r = S.get(URL, params={"response": "html", "date": date_param}, timeout=timeout)
+    r.raise_for_status()
+
+    # IMPORTANT: use StringIO for raw HTML
+    tables = pd.read_html(StringIO(r.text))
+    if not tables:
+        return pd.DataFrame()
+
+    # find table with columns 日期 + 收盤指數
+    for t in tables:
+        cols = [str(c).strip() for c in t.columns.tolist()]
+        if ("日期" in cols) and ("收盤指數" in cols):
+            df = t.copy()
+            df.columns = cols
+            return df
+    return pd.DataFrame()
+
+def build_hist(start: dt.date, end: dt.date, timeout: int) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    for y, m in month_iter(start, end):
+        dfm = fetch_month_table(y, m, timeout=timeout)
+        if dfm.empty:
+            continue
+        dfm["date"] = dfm["日期"].map(roc_to_ad)
+        dfm = dfm[dfm["date"] != ""].copy()
+        dfm["open"]  = dfm["開盤指數"].map(to_float)
+        dfm["high"]  = dfm["最高指數"].map(to_float)
+        dfm["low"]   = dfm["最低指數"].map(to_float)
+        dfm["close"] = dfm["收盤指數"].map(to_float)
+        dfm = dfm[["date","open","high","low","close"]].copy()
+        frames.append(dfm)
+
+    if not frames:
+        return pd.DataFrame()
+
+    hist = pd.concat(frames, ignore_index=True)
+    hist["date"] = hist["date"].astype(str)
+    hist = hist.dropna(subset=["close"])
+    hist = hist.drop_duplicates(["date"], keep="last")
+    hist = hist.sort_values("date").reset_index(drop=True)
+
+    s = start.strftime("%Y-%m-%d")
+    e = end.strftime("%Y-%m-%d")
+    hist = hist[(hist["date"] >= s) & (hist["date"] <= e)].copy()
+
+    hist["prev_close"] = hist["close"].shift(1)
+    hist["change_percent"] = ((hist["close"] - hist["prev_close"]) / hist["prev_close"]) * 100.0
+    hist["change_percent"] = hist["change_percent"].replace([float("inf"), float("-inf")], float("nan")).fillna(0.0)
+    hist.drop(columns=["prev_close"], inplace=True)
+    return hist
+
+def build_snapshot(hist: pd.DataFrame, fast: int, slow: int) -> pd.DataFrame:
+    df = hist.copy()
+    df["sma_fast"] = df["close"].rolling(fast, min_periods=fast).mean()
+    df["sma_slow"] = df["close"].rolling(slow, min_periods=slow).mean()
+
+    df["trend_ok"] = (df["close"] > df["sma_fast"]) & (df["close"] > df["sma_slow"])
+    df["trend_ok"] = df["trend_ok"].fillna(False)
+
+    # baseline: market_ok == trend_ok (you can later AND with breadth/vol filters)
+    df["market_ok"] = df["trend_ok"]
+    df["risk_mode"] = df["market_ok"].map(lambda x: "RISK_ON" if bool(x) else "RISK_OFF")
+
+    out = df[["date","risk_mode","trend_ok","market_ok","close","change_percent","sma_fast","sma_slow"]].copy()
+    out["date"] = out["date"].astype(str)
+    out["trend_ok"] = out["trend_ok"].astype(bool)
+    out["market_ok"] = out["market_ok"].astype(bool)
+    return out
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", required=True, help="YYYY-MM-DD")
+    ap.add_argument("--end", required=True, help="YYYY-MM-DD")
+    ap.add_argument("--fast", type=int, default=20)
+    ap.add_argument("--slow", type=int, default=60)
+    ap.add_argument("--timeout", type=int, default=25)
+    args = ap.parse_args()
+
+    start = ymd(args.start)
+    end = ymd(args.end)
+    if end < start:
+        raise SystemExit("end < start")
+
+    hist = build_hist(start, end, timeout=args.timeout)
+    if hist.empty:
+        raise SystemExit("No TAIEX hist rows produced (endpoint returned empty).")
+
+    os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
+    hist.to_csv(OUT_HIST, index=False, encoding="utf-8-sig")
+
+    snap = build_snapshot(hist, fast=args.fast, slow=args.slow)
+    snap.to_csv(OUT_SNAP, index=False, encoding="utf-8-sig")
+
+    print(f"OK: wrote -> {OUT_HIST} rows={len(hist)}")
+    print(f"OK: wrote -> {OUT_SNAP} rows={len(snap)} fast={args.fast} slow={args.slow}")
+    print("last 3 snapshot rows:")
+    print(snap.tail(3).to_string(index=False))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,441 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [string]$OutDir = ".\reports",
+  [switch]$Open,
+  [string]$TemplatePath = ".\templates\dashboard_template.html",
+  [string]$DailyCsvPath = ".\data\all_stocks_daily.csv"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function SafeTrim([object]$v){
+  if($null -eq $v){ return "" }
+  return ($v.ToString()).Trim()
+}
+function HtmlEncode([string]$s){
+  if($null -eq $s){ return "" }
+  return [System.Net.WebUtility]::HtmlEncode($s)
+}
+function FormatNum([object]$n){
+  if($null -eq $n){ return "" }
+  try { return ("{0:n0}" -f [double]$n) } catch { return ($n.ToString()) }
+}
+function FormatPct([object]$n){
+  if($null -eq $n){ return "" }
+  try { return ("{0:n2}%" -f [double]$n) } catch { return ($n.ToString()) }
+}
+function FormatRatioPct([object]$x){
+  if($null -eq $x){ return "" }
+  try { return ("{0:n0}%" -f ([double]$x * 100.0)) } catch { return ($x.ToString()) }
+}
+function ReadJson([string]$path){
+  if(!(Test-Path $path)){ return $null }
+  $raw = Get-Content $path -Raw -Encoding UTF8
+  if([string]::IsNullOrWhiteSpace($raw)){ return $null }
+  return ($raw | ConvertFrom-Json)
+}
+function GetProp([object]$obj, [string]$name, [object]$default=$null){
+  if($null -eq $obj){ return $default }
+  try{
+    $p = $obj.PSObject.Properties[$name]
+    if($null -eq $p){ return $default }
+    $v = $p.Value
+    if($null -eq $v){ return $default }
+    return $v
+  } catch { return $default }
+}
+function TryParseDouble([object]$v, [double]$fallback=0.0){
+  if($null -eq $v){ return $fallback }
+  try{ return [double]$v } catch { return $fallback }
+}
+function Resolve-Template([string]$preferred){
+  $candidates = @(
+    $preferred,
+    ".\templates\dashboard_template.html",
+    ".\templates\dashboard.html",
+    ".\templates\template.html"
+  ) | Select-Object -Unique
+
+  foreach($p in $candidates){
+    if([string]::IsNullOrWhiteSpace($p)){ continue }
+    if(Test-Path $p){ return (Resolve-Path $p).Path }
+  }
+  return $null
+}
+
+function LoadTopFromCsv([string]$csvPath, [string]$date, [int]$take){
+  if(!(Test-Path $csvPath)){ return $null }
+  $rows = Import-Csv -Path $csvPath -Encoding UTF8 | Where-Object { $_.date -eq $date }
+  if($null -eq $rows){ return $null }
+
+  $ranked = $rows | ForEach-Object {
+    [pscustomobject]@{
+      code = $_.code
+      name = $_.name
+      sector = $_.sector
+      change_percent = TryParseDouble $_.change_percent 0
+      total_score = TryParseDouble $_.total_score 0
+    }
+  } | Sort-Object -Property total_score -Descending
+
+  return ($ranked | Select-Object -First $take)
+}
+
+function RegimeLabel([string]$r){
+  $x = (SafeTrim $r)
+  switch ($x){
+    "Trend" { return "Trend" }
+    "Range" { return "Range" }
+    "HighVolatility" { return "HighVolatility" }
+    default { return $x }
+  }
+}
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  $Date = (Get-Date).ToString("yyyy-MM-dd")
+}
+
+$OutDirAbs = (Resolve-Path $OutDir -ErrorAction SilentlyContinue)
+if($null -eq $OutDirAbs){
+  New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+  $OutDirAbs = Resolve-Path $OutDir
+}
+$OutDirAbs = $OutDirAbs.Path
+
+$snapshotPath = Join-Path $OutDirAbs ("market_snapshot_{0}.json" -f $Date)
+$indicesPath  = Join-Path $OutDirAbs ("indices_{0}.json" -f $Date)
+$sectorPath   = Join-Path $OutDirAbs ("sector_heat_{0}.json" -f $Date)
+$regimePath   = Join-Path $OutDirAbs ("regime_{0}.json" -f $Date)
+$decisionPath = Join-Path $OutDirAbs ("decision_{0}.json" -f $Date)
+
+if(!(Test-Path $snapshotPath)){ throw "Market snapshot not found: $snapshotPath" }
+
+$templateResolved = Resolve-Template $TemplatePath
+if($null -eq $templateResolved){ throw "Template not found: $TemplatePath" }
+Write-Host ("INFO: using template -> {0}" -f $templateResolved) -ForegroundColor DarkGray
+$template = Get-Content $templateResolved -Raw -Encoding UTF8
+
+$snapshot = ReadJson $snapshotPath
+$indicesFile = ReadJson $indicesPath
+$sector = ReadJson $sectorPath
+$regFile = ReadJson $regimePath
+$decision = ReadJson $decisionPath
+
+# ---- indices ----
+$indices = $indicesFile
+if($null -eq $indices){ $indices = GetProp $snapshot "indices" $null }
+
+function RenderIndexCard([string]$key, [object]$idx){
+  if($null -eq $idx){ return "" }
+  $name = HtmlEncode (SafeTrim (GetProp $idx "name" $key))
+  $last = HtmlEncode (SafeTrim (GetProp $idx "last" ""))
+  $chg  = HtmlEncode (SafeTrim (GetProp $idx "change" ""))
+  $pct  = HtmlEncode (SafeTrim (GetProp $idx "change_percent" ""))
+
+  if($last -eq ""){ $last = "-" }
+  if($chg  -eq ""){ $chg  = "-" }
+  if($pct  -eq ""){ $pct  = "-" }
+
+  return @"
+<div class="card">
+  <div class="card-title">$name</div>
+  <div class="kpi">
+    <div class="kpi-main">$last</div>
+    <div class="kpi-sub">Chg $chg / $pct%</div>
+  </div>
+</div>
+"@
+}
+
+$indicesBlock = ""
+if($null -ne $indices){
+  $props = $indices.PSObject.Properties | Where-Object { $_.Name -notin @("source","fetched_at") }
+  foreach($p in $props){ $indicesBlock += (RenderIndexCard $p.Name $p.Value) }
+}
+
+# ---- KPI ----
+function RenderKpiRow([string]$label, [string]$value){
+  $l = HtmlEncode $label
+  $v = HtmlEncode $value
+  return "<div class=""kpi-row""><div class=""kpi-label"">$l</div><div class=""kpi-value"">$v</div></div>"
+}
+$metrics = GetProp $snapshot "metrics" $null
+$kpiRows = @()
+if($null -ne $metrics){
+  foreach($p in $metrics.PSObject.Properties){
+    if($null -eq $p.Value){ continue }
+    $kpiRows += (RenderKpiRow $p.Name (SafeTrim $p.Value))
+  }
+} else {
+  $kpiRows += (RenderKpiRow "metrics" "NA")
+}
+$kpiBlock = ($kpiRows -join "`r`n")
+
+# ---- band from sector breadth ----
+$advRatio = $null
+if($null -ne $sector){
+  $breadth = GetProp $sector "breadth" $null
+  if($null -ne $breadth){ $advRatio = GetProp $breadth "adv_ratio" $null }
+}
+
+$band = "NA"
+$suggestedPos = "NA"
+if($null -ne $advRatio){
+  $ms = [Math]::Round(100.0 * (TryParseDouble $advRatio 0.0), 2)
+  if($ms -ge 80){ $band = "80+: Breakout";      $suggestedPos = "Exposure: 70%-100% (aggressive)" }
+  elseif($ms -ge 60){ $band = "60-79: Bullish"; $suggestedPos = "Exposure: 50%-70% (trend-follow)" }
+  elseif($ms -ge 40){ $band = "40-59: Range";   $suggestedPos = "Exposure: 30%-50% (conservative)" }
+  else { $band = "LT40: Weak";                  $suggestedPos = "Exposure: 0%-30% (defensive)" }
+}
+
+# ---- sector blocks ----
+function RenderSectorTable([string]$title, [object]$rows){
+  $t = HtmlEncode $title
+  if($null -eq $rows){
+    return @"
+<div class="card">
+  <div class="card-title">$t</div>
+  <div class="muted">(no data)</div>
+</div>
+"@
+  }
+
+  $html = @()
+  $html += "<div class=""card"">"
+  $html += "<div class=""card-title"">$t</div>"
+  $html += "<table class=""table""><thead><tr><th>Sector</th><th>Count</th><th>Avg Chg%</th><th>Avg Score</th></tr></thead><tbody>"
+  foreach($r in $rows){
+    $sec = HtmlEncode (SafeTrim (GetProp $r "sector" ""))
+    $cnt = HtmlEncode (FormatNum (GetProp $r "count" 0))
+    $chg = HtmlEncode (FormatPct (GetProp $r "avg_change_percent" 0))
+    $scr = HtmlEncode (SafeTrim (GetProp $r "avg_total_score" ""))
+    $html += "<tr><td>$sec</td><td>$cnt</td><td>$chg</td><td>$scr</td></tr>"
+  }
+  $html += "</tbody></table></div>"
+  return ($html -join "`r`n")
+}
+
+$hotHtml = ""
+$weakHtml = ""
+$marketBreadthHtml = ""
+
+if($null -ne $sector){
+  $sectors = GetProp $sector "sectors" $null
+  $hot = GetProp $sectors "hot_top" $null
+  $weak = GetProp $sectors "weak_top" $null
+  $hotHtml = RenderSectorTable "Sector Heat Top 5" $hot
+  $weakHtml = RenderSectorTable "Sector Weak Top 5" $weak
+
+  $breadth = GetProp $sector "breadth" $null
+  $bucket  = GetProp $sector "score_buckets" $null
+  $conc    = GetProp $sector "concentration" $null
+
+  if($null -ne $breadth){
+    $adv = GetProp $breadth "adv" 0
+    $dec = GetProp $breadth "dec" 0
+    $flat = GetProp $breadth "flat" 0
+    $advR = GetProp $breadth "adv_ratio" 0
+    $decR = GetProp $breadth "dec_ratio" 0
+
+    $strong = GetProp $bucket "strong_80_plus" 0
+    $bull   = GetProp $bucket "bull_60_79" 0
+    $rangeB  = GetProp $bucket "range_40_59" 0
+    $weakCnt= GetProp $bucket "weak_under_40" 0
+
+    $topMean = GetProp $conc "top_mean_change_percent" 0
+    $botMean = GetProp $conc "bottom_mean_change_percent" 0
+    $n = GetProp $conc "top_n" 0
+
+    $marketBreadthHtml = @"
+<div class="card">
+  <div class="card-title">Tape Summary</div>
+  <div class="kpi-grid">
+    <div class="kpi-box">
+      <div class="kpi-label">Breadth (Adv/Dec/Flat)</div>
+      <div class="kpi-main">$adv / $dec / $flat</div>
+      <div class="kpi-sub">AdvRatio: $advR  DecRatio: $decR</div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-label">Score Buckets</div>
+      <div class="kpi-main">80+:$strong  60-79:$bull</div>
+      <div class="kpi-sub">40-59:$rangeB  LT40:$weakCnt</div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-label">Top/Bottom Concentration (Avg Chg%)</div>
+      <div class="kpi-main">Top($n): $topMean%</div>
+      <div class="kpi-sub">Bottom($n): $botMean%</div>
+    </div>
+  </div>
+</div>
+"@
+  }
+}
+
+# ---- Regime block snapshot-first ----
+$reg = GetProp $snapshot "regime" $null
+if($null -eq $reg){ $reg = $regFile }
+
+$regimeName = GetProp $reg "market_regime" (GetProp $snapshot "market_regime" "NA")
+$volState   = GetProp $reg "volatility_state" (GetProp $snapshot "volatility_state" "NA")
+$trendStr   = GetProp $reg "trend_strength" (GetProp $snapshot "trend_strength" "NA")
+$confScore  = GetProp $reg "confidence_score" (GetProp $snapshot "confidence_score" "NA")
+$expo       = GetProp $reg "suggested_exposure" (GetProp $snapshot "suggested_exposure" "NA")
+$noTrade    = GetProp $reg "no_trade_flag" (GetProp $snapshot "no_trade_flag" $false)
+$noReason   = GetProp $reg "no_trade_reason" (GetProp $snapshot "no_trade_reason" "")
+$note       = GetProp $reg "note" (GetProp $snapshot "note" "")
+$ver        = GetProp $reg "version" (GetProp $snapshot "version" "")
+
+$regimeBlock = ""
+if($regimeName -ne "NA" -or $ver -ne ""){
+  $r = HtmlEncode (RegimeLabel (SafeTrim $regimeName))
+  $vs = HtmlEncode (SafeTrim $volState)
+  $ts = HtmlEncode (SafeTrim $trendStr)
+  $cs = HtmlEncode (SafeTrim $confScore)
+  $ex = HtmlEncode (FormatRatioPct $expo)
+  $note2 = HtmlEncode (SafeTrim $note)
+  $ver2 = HtmlEncode (SafeTrim $ver)
+
+  $warn = ""
+  if([bool]$noTrade -eq $true){
+    $reason = HtmlEncode (SafeTrim $noReason)
+    if($reason -eq ""){ $reason = "Rule triggered" }
+    $warn = "<div class=""kpi-sub"" style=""margin-top:6px; font-weight:700; color:#b00020;"">NO-TRADE: $reason</div>"
+  }
+
+  $regimeBlock = @"
+<div class="card">
+  <div class="card-title">Market Thermometer (Regime) <span class="muted" style="font-size:12px;">$ver2</span></div>
+  <div class="kpi-grid">
+    <div class="kpi-box">
+      <div class="kpi-label">Regime</div>
+      <div class="kpi-main">$r</div>
+      <div class="kpi-sub">Volatility: $vs</div>
+      $warn
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-label">Trend Strength / Confidence</div>
+      <div class="kpi-main">$ts</div>
+      <div class="kpi-sub">Confidence: $cs</div>
+      <div class="kpi-sub">$note2</div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-label">Suggested Exposure</div>
+      <div class="kpi-main">$ex</div>
+      <div class="kpi-sub">Capital: $(HtmlEncode (FormatNum $Capital))</div>
+    </div>
+  </div>
+</div>
+"@
+}
+
+# ---- Decision block (optional) ----
+$decisionBlock = ""
+if($null -ne $decision){
+  $verD = HtmlEncode (SafeTrim (GetProp $decision "version" ""))
+  $d = GetProp $decision "decision" $null
+  $inp = GetProp $decision "inputs" $null
+  $nts = GetProp $decision "notes" $null
+
+  $strategy = HtmlEncode (SafeTrim (GetProp $d "strategy_id" "NA"))
+  $gate = HtmlEncode (SafeTrim (GetProp $d "gate" "NA"))
+  $allow = HtmlEncode (SafeTrim (GetProp $d "allow_trade" "NA"))
+  $exp = HtmlEncode (FormatRatioPct (GetProp $d "exposure" 0))
+  $maxVal = HtmlEncode (FormatNum (GetProp $d "max_position_value" 0))
+  $perTrade = HtmlEncode (FormatNum (GetProp $d "per_trade_budget" 0))
+  $maxPos = HtmlEncode (FormatNum (GetProp $inp "max_positions" 0))
+  $reason = HtmlEncode (SafeTrim (GetProp $inp "no_trade_reason" ""))
+
+  $noteS = HtmlEncode (SafeTrim (GetProp $nts "strategy_note" ""))
+  $noteR = HtmlEncode (SafeTrim (GetProp $nts "regime_note" ""))
+
+  $warnD = ""
+  if(($gate -eq "NO_TRADE") -or ($allow -eq "False")){
+    if($reason -eq ""){ $reason = "Gate is NO_TRADE" }
+    $warnD = "<div class=""kpi-sub"" style=""margin-top:6px; font-weight:700; color:#b00020;"">NO-TRADE: $reason</div>"
+  }
+
+  $decisionBlock = @"
+<div class="card">
+  <div class="card-title">Decision Router <span class="muted" style="font-size:12px;">$verD</span></div>
+  <div class="kpi-grid">
+    <div class="kpi-box">
+      <div class="kpi-label">Strategy</div>
+      <div class="kpi-main">$strategy</div>
+      <div class="kpi-sub">Gate: $gate  Allow: $allow</div>
+      $warnD
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-label">Exposure / Budgets</div>
+      <div class="kpi-main">$exp</div>
+      <div class="kpi-sub">Max Position Value: $maxVal</div>
+      <div class="kpi-sub">Per Trade Budget (/$maxPos): $perTrade</div>
+    </div>
+    <div class="kpi-box">
+      <div class="kpi-label">Notes</div>
+      <div class="kpi-main">Router</div>
+      <div class="kpi-sub">$noteS</div>
+      <div class="kpi-sub">$noteR</div>
+    </div>
+  </div>
+</div>
+"@
+}
+
+# ---- Top list ----
+$topList = GetProp $snapshot "top" $null
+if($null -eq $topList){ $topList = LoadTopFromCsv $DailyCsvPath $Date $Top }
+
+$topRows = @()
+if($null -ne $topList){
+  $i = 0
+  foreach($it in $topList){
+    $i++
+    if($i -gt $Top){ break }
+    $code = HtmlEncode (SafeTrim (GetProp $it "code" ""))
+    $name = HtmlEncode (SafeTrim (GetProp $it "name" ""))
+    $sectorName = HtmlEncode (SafeTrim (GetProp $it "sector" ""))
+    $chg = HtmlEncode (FormatPct (GetProp $it "change_percent" 0))
+    $score = HtmlEncode (SafeTrim (GetProp $it "total_score" ""))
+    $topRows += "<tr><td>$i</td><td>$code</td><td>$name</td><td>$sectorName</td><td>$chg</td><td>$score</td></tr>"
+  }
+}
+
+$topBlock = @"
+<div class="card">
+  <div class="card-title">Top Stocks (by total_score)</div>
+  <table class="table">
+    <thead><tr><th>#</th><th>Code</th><th>Name</th><th>Sector</th><th>Chg%</th><th>Score</th></tr></thead>
+    <tbody>
+      $($topRows -join "`r`n")
+    </tbody>
+  </table>
+</div>
+"@
+
+# ---- Render final ----
+$html = $template
+$html = $html.Replace("__DATE__", (HtmlEncode $Date))
+$html = $html.Replace("__CAPITAL__", (HtmlEncode (FormatNum $Capital)))
+$html = $html.Replace("__TOP__", (HtmlEncode (FormatNum $Top)))
+$html = $html.Replace("__BAND__", (HtmlEncode $band))
+$html = $html.Replace("__SUGGESTED_POS__", (HtmlEncode $suggestedPos))
+$html = $html.Replace("__INDICES_BLOCK__", $indicesBlock)
+$html = $html.Replace("__KPI_BLOCK__", $kpiBlock)
+$html = $html.Replace("__TOP_BLOCK__", $topBlock)
+$html = $html.Replace("__HOT_ZONES__", $hotHtml)
+$html = $html.Replace("__WEAK_ZONES__", $weakHtml)
+$html = $html.Replace("__MARKET_BREADTH__", $marketBreadthHtml)
+$html = $html.Replace("__REGIME_BLOCK__", $regimeBlock)
+$html = $html.Replace("__DECISION_BLOCK__", $decisionBlock)
+
+$outHtml = Join-Path $OutDirAbs ("dashboard_{0}.html" -f $Date)
+$utf8NoBom2 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($outHtml, $html.Replace("`r`n","`n").Replace("`n","`r`n"), $utf8NoBom2)
+
+Write-Host ("OK: wrote HTML -> {0}" -f $outHtml) -ForegroundColor Green
+if($Open){ Start-Process $outHtml | Out-Null }

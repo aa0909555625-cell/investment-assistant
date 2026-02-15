@@ -1,0 +1,228 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [string]$OutDir = ".\reports",
+  [switch]$Open,
+  [int]$DiversifyN = 6
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function SafeTrim([object]$v){ if($null -eq $v){""} else { ([string]$v).Trim() } }
+
+function Get-Prop {
+  param(
+    [Parameter(Mandatory=$true)] $Obj,
+    [Parameter(Mandatory=$true)] [string] $Name,
+    $Default = $null
+  )
+  try{
+    if($null -eq $Obj){ return $Default }
+    if($Obj -is [System.Collections.IDictionary]){
+      if($Obj.Contains($Name)){ return $Obj[$Name] }
+      return $Default
+    }
+    $p = $Obj.PSObject.Properties[$Name]
+    if($null -ne $p){ return $p.Value }
+    return $Default
+  } catch { return $Default }
+}
+
+function To-Num([object]$v, [double]$def = 0){
+  $s = SafeTrim $v
+  if($s -eq ""){ return $def }
+  $s = $s.Replace("%","")
+  $x = $def
+  if([double]::TryParse($s, [ref]$x)){ return $x }
+  return $def
+}
+
+function Round2([double]$x){ [Math]::Round($x, 2, [MidpointRounding]::AwayFromZero) }
+function Round0([double]$x){ [Math]::Round($x, 0, [MidpointRounding]::AwayFromZero) }
+function H([string]$s){ [System.Web.HttpUtility]::HtmlEncode($s) }
+
+if([string]::IsNullOrWhiteSpace($Date)){ $Date = (Get-Date -Format "yyyy-MM-dd") }
+
+$OutDirFull = (Resolve-Path $OutDir).Path
+$indicesPath = Join-Path $OutDirFull ("indices_{0}.json" -f $Date)
+$snapPath    = Join-Path $OutDirFull ("market_snapshot_{0}.json" -f $Date)
+if(!(Test-Path $indicesPath)){ throw "Missing indices json: $indicesPath" }
+if(!(Test-Path $snapPath)){ throw "Missing snapshot json: $snapPath" }
+
+$indices = Get-Content $indicesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$snap    = Get-Content $snapPath    -Raw -Encoding UTF8 | ConvertFrom-Json
+
+$taiexLast = Get-Prop (Get-Prop $indices "taiex" @{}) "last" 0
+$tpexLast  = Get-Prop (Get-Prop $indices "tpex"  @{}) "last" 0
+$taiexPct  = To-Num (Get-Prop (Get-Prop $indices "taiex" @{}) "change_percent" 0) 0
+$tpexPct   = To-Num (Get-Prop (Get-Prop $indices "tpex"  @{}) "change_percent" 0) 0
+
+$ms = Get-Prop $snap "market_state" @{}
+$mode = SafeTrim (Get-Prop $ms "mode" "neutral")
+$risk = To-Num (Get-Prop $ms "risk" 0) 0
+$notes = Get-Prop $ms "notes" @()
+
+$ts = Get-Prop $snap "tape_summary" @{}
+$band = SafeTrim (Get-Prop $ts "band" "")
+$strategy = SafeTrim (Get-Prop $ts "strategy" "")
+$suggestedPos = To-Num (Get-Prop $ts "suggested_position" 0) 0
+
+$metrics = Get-Prop $snap "metrics" @{}
+$conc = To-Num (Get-Prop $metrics "heat_concentration_top3" 0) 0
+$spread = To-Num (Get-Prop $metrics "heat_spread" 0) 0
+$divg = To-Num (Get-Prop $metrics "index_divergence" 0) 0
+
+# Position Framework
+$capital = [double]$Capital
+if($suggestedPos -lt 0){ $suggestedPos = 0 }
+if($suggestedPos -gt 1){ $suggestedPos = 1 }
+$investable = $capital * $suggestedPos
+$reserved = $capital - $investable
+if($DiversifyN -le 0){ $DiversifyN = 6 }
+$perTicket = $investable / [double]$DiversifyN
+
+# warning if snapshot has allocation.cash_reserved and diverges > 5%
+$warning = ""
+$allocNode = $null
+try{ $allocNode = Get-Prop $snap "allocation" $null } catch { $allocNode = $null }
+if($null -ne $allocNode){
+  $cashReserved = Get-Prop $allocNode "cash_reserved" $null
+  if($null -ne $cashReserved){
+    $cr = To-Num $cashReserved 0
+    $diff = [Math]::Abs($cr - $reserved)
+    if($diff -gt ($capital * 0.05)){
+      $warning = "WARNING: cash_reserved=$([int](Round0 $cr)) vs reserved_amount=$([int](Round0 $reserved)) mismatch. Check upstream allocation logic."
+    }
+  }
+}
+
+# Sector Heat
+$sector = Get-Prop $snap "sector_heat" @{}
+$topS = Get-Prop $sector "top" @()
+$botS = Get-Prop $sector "bottom" @()
+function SectorLines($arr, $n){
+  $out = @()
+  $i = 0
+  foreach($x in $arr){
+    if($i -ge $n){ break }
+    $sec = SafeTrim (Get-Prop $x "sector" "")
+    $cp  = Round2 (To-Num (Get-Prop $x "avg_change_percent" 0) 0)
+    $hs  = Round2 (To-Num (Get-Prop $x "heat_score" 0) 0)
+    $out += ("{0} ({1}%, heat={2})" -f $sec, $cp, $hs)
+    $i++
+  }
+  return $out
+}
+$topLines = SectorLines $topS 6
+$botLines = SectorLines $botS 6
+
+# Labels
+$modeLabel = $mode
+if($mode -eq "risk_on"){ $modeLabel = "Risk-On" }
+elseif($mode -eq "risk_off"){ $modeLabel = "Risk-Off" }
+elseif($mode -eq "neutral"){ $modeLabel = "Neutral" }
+$bandLabel = $band; if([string]::IsNullOrWhiteSpace($bandLabel)){ $bandLabel = "" }
+$strategyLabel = $strategy; if([string]::IsNullOrWhiteSpace($strategyLabel)){ $strategyLabel = "" }
+$concPct = Round2 ($conc * 100.0)
+
+$css = @(
+":root{--bg:#0b1020;--card:#111a33;--muted:#9fb0d0;--text:#eef3ff;--line:#223055;--warn:#ffcc66}"
+"*{box-sizing:border-box}"
+"body{margin:0;font-family:Segoe UI,Arial,'Noto Sans TC',sans-serif;background:var(--bg);color:var(--text)}"
+".wrap{max-width:1200px;margin:0 auto;padding:18px}"
+"h1{font-size:22px;margin:0 0 10px 0}"
+".grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}"
+".card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}"
+".kpi{display:flex;align-items:baseline;gap:10px}"
+".kpi .v{font-size:26px;font-weight:700}"
+".kpi .s{font-size:13px;color:var(--muted)}"
+".small{font-size:13px;color:var(--muted);line-height:1.55}"
+".list{margin:8px 0 0 18px}"
+".badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);font-size:12px;color:var(--muted)}"
+".row{display:flex;justify-content:space-between;gap:10px}"
+"hr{border:0;border-top:1px solid var(--line);margin:10px 0}"
+".warn{color:var(--warn);font-weight:600}"
+) -join "`n"
+
+$html = @()
+$html += "<!doctype html>"
+$html += "<html><head><meta charset='utf-8'/>"
+$html += "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+$html += "<title>Investment Assistant Dashboard $Date</title>"
+$html += "<style>$css</style>"
+$html += "</head><body><div class='wrap'>"
+$html += "<h1>Dashboard / $Date <span class='badge'>Top=$Top</span> <span class='badge'>Capital=$Capital</span></h1>"
+$html += "<div class='grid'>"
+
+# Indices card
+$html += "<div class='card' style='grid-column: span 6;'>"
+$html += "<div class='row'><div class='kpi'><div class='v'>TAIEX</div><div class='s'>Last: $(H ([string]$taiexLast))</div></div><div class='kpi'><div class='v'>$(H ([string](Round2 $taiexPct)))%</div><div class='s'>chg%</div></div></div>"
+$html += "<hr/>"
+$html += "<div class='row'><div class='kpi'><div class='v'>TPEX</div><div class='s'>Last: $(H ([string]$tpexLast))</div></div><div class='kpi'><div class='v'>$(H ([string](Round2 $tpexPct)))%</div><div class='s'>chg%</div></div></div>"
+$html += "</div>"
+
+# Market State card
+$html += "<div class='card' style='grid-column: span 6;'>"
+$html += "<div class='row'><div class='kpi'><div class='v'>Market State</div><div class='s'>Mode</div></div><div class='kpi'><div class='v'>$(H $modeLabel)</div><div class='s'>Risk=$(H ([string](Round2 $risk)))</div></div></div>"
+$html += "<div class='small' style='margin-top:10px;'>Band: <b>$(H $bandLabel)</b><br/>Strategy: $(H $strategyLabel)</div>"
+if($notes -and $notes.Count -gt 0){
+  $html += "<ul class='small list'>"
+  foreach($n in $notes){ $html += "<li>$(H ([string]$n))</li>" }
+  $html += "</ul>"
+}
+$html += "</div>"
+
+# Tape Summary card
+$hot = Get-Prop $ts "hot_zones" @()
+$weak = Get-Prop $ts "weak_zones" @()
+$html += "<div class='card' style='grid-column: span 6;'>"
+$html += "<div class='kpi'><div class='v'>Tape Summary</div><div class='s'>hot/weak</div></div>"
+$html += "<div class='small' style='margin-top:8px;'><b>Hot:</b> $(H (($hot -join ' / ')))</div>"
+$html += "<div class='small' style='margin-top:6px;'><b>Weak:</b> $(H (($weak -join ' / ')))</div>"
+$html += "</div>"
+
+# Breadth Metrics card
+$html += "<div class='card' style='grid-column: span 6;'>"
+$html += "<div class='kpi'><div class='v'>Breadth Metrics</div><div class='s'>(盤勢結構)</div></div>"
+$html += "<div class='small' style='margin-top:10px;'>"
+$html += "<div class='row'><div>Heat Concentration (Top3/Top10)</div><div><b>$(H ([string]$concPct))%</b></div></div>"
+$html += "<div class='row'><div>Heat Spread (Top3 vs Bottom3)</div><div><b>$(H ([string](Round2 $spread)))</b></div></div>"
+$html += "<div class='row'><div>Index Divergence (TAIEX%-TPEX%)</div><div><b>$(H ([string](Round2 $divg)))</b></div></div>"
+$html += "</div></div>"
+
+# Sector Heat card
+$html += "<div class='card' style='grid-column: span 6;'>"
+$html += "<div class='kpi'><div class='v'>Sector Heat</div><div class='s'>Top/Bottom</div></div>"
+$html += "<div class='small' style='margin-top:8px;'><b>Top:</b><ul class='list'>"
+foreach($l in $topLines){ $html += "<li>$(H $l)</li>" }
+$html += "</ul></div>"
+$html += "<div class='small' style='margin-top:6px;'><b>Bottom:</b><ul class='list'>"
+foreach($l in $botLines){ $html += "<li>$(H $l)</li>" }
+$html += "</ul></div>"
+$html += "</div>"
+
+# Position Framework card
+$html += "<div class='card' style='grid-column: span 6;'>"
+$html += "<div class='kpi'><div class='v'>Position Framework</div><div class='s'>(可執行)</div></div>"
+$html += "<div class='small' style='margin-top:10px;'>"
+$html += "<div class='row'><div>Suggested Position</div><div><b>$(H ([string](Round2 ($suggestedPos*100.0))))%</b></div></div>"
+$html += "<div class='row'><div>Investable Amount</div><div><b>$(H ([string](Round0 $investable)))</b></div></div>"
+$html += "<div class='row'><div>Reserved (Cash)</div><div><b>$(H ([string](Round0 $reserved)))</b></div></div>"
+$html += "<div class='row'><div>Diversify N</div><div><b>$(H ([string]$DiversifyN))</b></div></div>"
+$html += "<div class='row'><div>Per Ticket Cap</div><div><b>$(H ([string](Round0 $perTicket)))</b></div></div>"
+if($warning -ne ""){ $html += "<div class='warn' style='margin-top:10px;'>$(H $warning)</div>" }
+$html += "</div></div>"
+
+$html += "</div>"
+$html += "<div class='small' style='margin-top:12px;color:var(--muted)'>Generated: $(H ([string](Get-Date -Format 'yyyy-MM-dd HH:mm:ss')))</div>"
+$html += "</div></body></html>"
+
+$outPath = Join-Path $OutDirFull ("dashboard_{0}.html" -f $Date)
+$utf8NoBomLocal = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($outPath, ($html -join "`r`n"), $utf8NoBomLocal)
+Write-Host ("OK: wrote HTML -> {0}" -f $outPath) -ForegroundColor Green
+if($Open){ Start-Process $outPath | Out-Null }

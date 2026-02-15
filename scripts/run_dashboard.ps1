@@ -1,0 +1,101 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [string]$ReportsDir = ".\reports",
+  [switch]$Open
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Run-Step([string]$label, [scriptblock]$sb){
+  Write-Host ("=== {0} ===" -f $label) -ForegroundColor Cyan
+  & $sb
+  if($LASTEXITCODE -ne 0){ throw "$label failed (exit=$LASTEXITCODE)" }
+  Write-Host ("[OK] {0}" -f $label) -ForegroundColor Green
+}
+
+function Get-LatestRankingDate([string]$dataDir){
+  # Prefer filename pattern: ranking_YYYY-MM-DD.csv
+  $files = @(
+    Get-ChildItem $dataDir -File -Filter "ranking_????-??-??.csv" -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending
+  )
+
+  if($files -and $files.Length -gt 0){
+    $m = [regex]::Match($files[0].Name, '^ranking_(\d{4}-\d{2}-\d{2})\.csv$')
+    if($m.Success){ return $m.Groups[1].Value }
+  }
+
+  # Fallback: parse last line date from ranking_history.csv
+  $rh = Join-Path $dataDir "ranking_history.csv"
+  if(Test-Path $rh){
+    $last = (Get-Content $rh -Tail 1 -Encoding UTF8)
+    if($last){
+      $d = ($last -split "," | Select-Object -First 1).Trim('"').Trim()
+      if($d -match '^\d{4}-\d{2}-\d{2}$'){ return $d }
+    }
+  }
+
+  return (Get-Date).ToString("yyyy-MM-dd")
+}
+
+$root = (Get-Location).Path
+$py   = Join-Path $root ".\.venv\Scripts\python.exe"
+if(!(Test-Path $py)){ throw "Python venv not found: $py" }
+
+$env:PYTHONIOENCODING = "utf-8"
+
+# 1) weekly_pipeline.py (NOTE: does NOT accept --date)
+Run-Step "weekly_pipeline.py" {
+  & $py ".\scripts\weekly_pipeline.py" --capital $Capital --top $Top
+}
+
+# Decide RunDate based on newest ranking output produced by weekly_pipeline
+$dataDir = Join-Path $root "data"
+$runDate = Get-LatestRankingDate $dataDir
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  $Date = $runDate
+}else{
+  if($Date -ne $runDate){
+    Write-Host ("[WARN] weekly_pipeline.py cannot take --date. Requested Date={0}, but latest produced RunDate={1}. Using RunDate." -f $Date, $runDate) -ForegroundColor Yellow
+    $Date = $runDate
+  }
+}
+
+# 2) market_pack_v1.py
+$sectorMap = Join-Path $root ".\data\sector_map.csv"
+if(Test-Path $sectorMap){
+  Run-Step "market_pack_v1.py" {
+    & $py ".\scripts\market_pack_v1.py" --in ".\data\all_stocks_daily.csv" --outdir $ReportsDir --sector_map $sectorMap
+  }
+}else{
+  Run-Step "market_pack_v1.py" {
+    & $py ".\scripts\market_pack_v1.py" --in ".\data\all_stocks_daily.csv" --outdir $ReportsDir
+  }
+}
+
+# 3) allocation_pack_v1.py (NEW API: no --plan_csv)
+Run-Step "allocation_pack_v1.py" {
+  & $py ".\scripts\allocation_pack_v1.py" --date $Date --capital $Capital --outdir $ReportsDir --root "." --reports_dir $ReportsDir --top 8 --min_items 1
+}
+
+# 4) build_dashboard_html.ps1
+$bd = Join-Path $root ".\scripts\build_dashboard_html.ps1"
+if(!(Test-Path $bd)){ throw "Missing: scripts/build_dashboard_html.ps1" }
+
+if($Open){
+  Run-Step "build_dashboard_html.ps1" {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bd -Date $Date -ReportsDir $ReportsDir -Open
+  }
+}else{
+  Run-Step "build_dashboard_html.ps1" {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bd -Date $Date -ReportsDir $ReportsDir
+  }
+}
+
+Write-Host ("[OK] DONE: run_dashboard.ps1 finished (RunDate={0}, Capital={1}, Open={2})" -f $Date, $Capital, [bool]$Open) -ForegroundColor Green

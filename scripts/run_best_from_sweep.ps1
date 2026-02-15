@@ -1,4 +1,4 @@
-﻿Write-Host "=== Investment Assistant :: Phase ⑥-2 Best From Sweep ==="
+Write-Host "=== Investment Assistant :: Phase ⑥-2 Best From Sweep ==="
 
 $IN = "data/metrics_sweep.csv"
 if (-not (Test-Path $IN)) {

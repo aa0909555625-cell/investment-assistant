@@ -1,0 +1,179 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 200,
+
+  # compatibility: run_dashboard.ps1 uses ReportsDir; older callers may use OutDir
+  [Alias("OutDir")]
+  [string]$ReportsDir = ".\reports",
+
+  [string]$TemplatePath = ".\templates\dashboard_template.html",
+  [switch]$Open,
+  [switch]$ListDates
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# [MARKER] BUILD_DASHBOARD_HTML_v4
+
+function EnsureDir([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){ return }
+  if(!(Test-Path $p)){ New-Item -ItemType Directory -Force -Path $p | Out-Null }
+}
+
+function Resolve-Abs([string]$p){
+  if([string]::IsNullOrWhiteSpace($p)){ return $p }
+  try { return (Resolve-Path $p).Path } catch { return [System.IO.Path]::GetFullPath($p) }
+}
+
+function Get-LatestDateInReports([string]$dir){
+  if(!(Test-Path $dir)){ return "" }
+  $files = Get-ChildItem $dir -File -Filter "market_snapshot_????-??-??.json" -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending
+  if($files -and $files.Count -gt 0){
+    $m = [regex]::Match($files[0].Name, '^market_snapshot_(\d{4}-\d{2}-\d{2})\.json$')
+    if($m.Success){ return $m.Groups[1].Value }
+  }
+  return ""
+}
+
+function Try-ReplaceToken([string]$html,[string[]]$tokens,[string]$value){
+  foreach($t in $tokens){
+    if($html -like "*$t*"){
+      $html = $html.Replace($t, $value)
+    }
+  }
+  return $html
+}
+
+# ---- normalize paths ----
+$projectRoot = (Resolve-Path ".").Path
+$ReportsDir = Resolve-Abs $ReportsDir
+$TemplatePath = Resolve-Abs $TemplatePath
+EnsureDir $ReportsDir
+
+if($ListDates){
+  Get-ChildItem $ReportsDir -File -Filter "market_snapshot_????-??-??.json" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      $m = [regex]::Match($_.Name, '^market_snapshot_(\d{4}-\d{2}-\d{2})\.json$')
+      if($m.Success){ $m.Groups[1].Value }
+    } | Sort-Object -Unique
+  exit 0
+}
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  $Date = Get-LatestDateInReports $ReportsDir
+}
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  throw "No Date provided and cannot infer latest date from ReportsDir=$ReportsDir (need market_snapshot_YYYY-MM-DD.json)."
+}
+
+# ---- locate json inputs (best-effort) ----
+$marketSnapshot = Join-Path $ReportsDir ("market_snapshot_{0}.json" -f $Date)
+$sectorHeat     = Join-Path $ReportsDir ("sector_heat_{0}.json" -f $Date)
+$regimeJson      = Join-Path $ReportsDir ("regime_{0}.json" -f $Date)
+$decisionJson    = Join-Path $ReportsDir ("decision_{0}.json" -f $Date)
+$allocationJson  = Join-Path $ReportsDir ("allocation_{0}.json" -f $Date)
+
+# ---- read template if exists, else fallback template ----
+$html = ""
+if(Test-Path $TemplatePath){
+  $html = Get-Content $TemplatePath -Raw -Encoding UTF8
+} else {
+  $html = @"
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Investment Dashboard</title></head>
+<body>
+<h1>Investment Dashboard</h1>
+<div id="app"></div>
+</body></html>
+"@
+}
+
+# ---- token replacements (support multiple possible placeholders) ----
+# If template has placeholders, replace them; otherwise we'll inject a minimal JS viewer.
+$html2 = $html
+
+# Common placeholder guesses; safe to run even if not present
+$html2 = Try-ReplaceToken $html2 @("__DATE__","{{DATE}}","{{date}}") $Date
+$html2 = Try-ReplaceToken $html2 @("__CAPITAL__","{{CAPITAL}}","{{capital}}") ("$Capital")
+$html2 = Try-ReplaceToken $html2 @("__TOP__","{{TOP}}","{{top}}") ("$Top")
+
+# absolute paths for local file open (file://) compatibility
+$msAbs  = (Test-Path $marketSnapshot) ? (Resolve-Abs $marketSnapshot) : ""
+$shAbs  = (Test-Path $sectorHeat)     ? (Resolve-Abs $sectorHeat)     : ""
+$rgAbs  = (Test-Path $regimeJson)     ? (Resolve-Abs $regimeJson)     : ""
+$dcAbs  = (Test-Path $decisionJson)   ? (Resolve-Abs $decisionJson)   : ""
+$alAbs  = (Test-Path $allocationJson) ? (Resolve-Abs $allocationJson) : ""
+
+$html2 = Try-ReplaceToken $html2 @("__MARKET_SNAPSHOT_JSON__","{{MARKET_SNAPSHOT_JSON}}","{{market_snapshot_json}}") $msAbs
+$html2 = Try-ReplaceToken $html2 @("__SECTOR_HEAT_JSON__","{{SECTOR_HEAT_JSON}}","{{sector_heat_json}}") $shAbs
+$html2 = Try-ReplaceToken $html2 @("__REGIME_JSON__","{{REGIME_JSON}}","{{regime_json}}") $rgAbs
+$html2 = Try-ReplaceToken $html2 @("__DECISION_JSON__","{{DECISION_JSON}}","{{decision_json}}") $dcAbs
+$html2 = Try-ReplaceToken $html2 @("__ALLOCATION_JSON__","{{ALLOCATION_JSON}}","{{allocation_json}}") $alAbs
+
+# ---- if template had no placeholders, inject a minimal viewer so it's still useful ----
+$hasAnyPathInjected = $false
+foreach($p in @($msAbs,$shAbs,$rgAbs,$dcAbs,$alAbs)){
+  if($p -and $p.Trim() -ne ""){ $hasAnyPathInjected = $true; break }
+}
+
+$injectViewer = @"
+<!-- injected viewer (BUILD_DASHBOARD_HTML_v4) -->
+<script>
+(async function(){
+  function el(tag, txt){ var e=document.createElement(tag); if(txt!==undefined){ e.textContent=txt; } return e; }
+  var root = document.getElementById('app') || document.body;
+  root.appendChild(el('h2','Data Pack'));
+  var items = [
+    ['market_snapshot','${msAbs.replace('\','\\')}'],
+    ['sector_heat','${shAbs.replace('\','\\')}'],
+    ['regime','${rgAbs.replace('\','\\')}'],
+    ['decision','${dcAbs.replace('\','\\')}'],
+    ['allocation','${alAbs.replace('\','\\')}']
+  ];
+  var ul = el('ul'); root.appendChild(ul);
+
+  async function loadJson(path){
+    if(!path){ return null; }
+    try{
+      // file:// fetch often blocked; use pre-render by showing path + let user open JSON separately
+      return null;
+    }catch(e){ return null; }
+  }
+
+  items.forEach(function(it){
+    var li = el('li');
+    li.appendChild(el('b', it[0] + ': '));
+    li.appendChild(el('span', it[1] || '(missing)'));
+    ul.appendChild(li);
+  });
+
+  root.appendChild(el('p',"Note: If template placeholders exist, they were replaced. Otherwise this viewer shows resolved file paths for today's pack."));
+})();
+</script>
+"@
+
+# Detect whether template seems to already have an app container and/or placeholders
+$hadKnownTokens = ($html -match "__MARKET_SNAPSHOT_JSON__|{{MARKET_SNAPSHOT_JSON}}|__SECTOR_HEAT_JSON__|{{SECTOR_HEAT_JSON}}|__REGIME_JSON__|__DECISION_JSON__|__ALLOCATION_JSON__")
+
+if(-not $hadKnownTokens){
+  if($html2 -match "</body>"){
+    $html2 = [regex]::Replace($html2, "</body>", ($injectViewer + "`r`n</body>"), 1)
+  } else {
+    $html2 = $html2 + "`r`n" + $injectViewer + "`r`n"
+  }
+}
+
+# ---- write output ----
+$outPath = Join-Path $ReportsDir ("dashboard_{0}.html" -f $Date)
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($outPath, $html2.Replace("`r`n","`n").Replace("`n","`r`n"), $utf8NoBom)
+
+Write-Host ("OK: wrote HTML -> {0}" -f $outPath) -ForegroundColor Green
+if($Open){ Start-Process $outPath | Out-Null }
+exit 0

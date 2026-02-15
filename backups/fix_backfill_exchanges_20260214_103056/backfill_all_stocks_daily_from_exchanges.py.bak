@@ -1,0 +1,305 @@
+# -*- coding: utf-8 -*-
+"""
+Backfill multi-trading-dates into data/all_stocks_daily.csv by fetching:
+- TWSE: https://www.twse.com.tw/exchangeReport/MI_INDEX?response=json&type=ALLBUT0999&date=YYYYMMDD
+- TPEx: https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php?l=zh-tw&d=ROCYYY/MM/DD
+
+This script:
+- Reads existing data/all_stocks_daily.csv header as target schema
+- Fetches rows for each date
+- Aligns columns to schema (missing -> blank)
+- Appends + de-duplicates by (date, code)
+"""
+from __future__ import annotations
+import argparse
+import csv
+import json
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Tuple
+
+import requests
+import pandas as pd
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+OUT_MAIN = os.path.join(ROOT, "data", "all_stocks_daily.csv")
+
+TWSE_URL = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+TPEX_URL = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept": "application/json,text/html,*/*",
+})
+
+def ymd_to_roc_slash(ymd: str) -> str:
+    d = datetime.strptime(ymd, "%Y-%m-%d").date()
+    roc = d.year - 1911
+    return f"{roc:03d}/{d.month:02d}/{d.day:02d}"
+
+def fetch_twse(ymd: str, timeout: int = 25) -> pd.DataFrame:
+    ymd_noslash = ymd.replace("-", "")
+    params = {"response": "json", "type": "ALLBUT0999", "date": ymd_noslash}
+    r = SESSION.get(TWSE_URL, params=params, timeout=timeout)
+    r.raise_for_status()
+    j = r.json()
+
+    # MI_INDEX structure: tables in "data5" or "data9" depending on type/day; headers in "fieldsX"
+    # We'll search for the first data* that looks like stock rows (first col is code length 4-6 and numeric)
+    data_keys = [k for k in j.keys() if re.fullmatch(r"data\d+", k or "")]
+    rows: List[List[str]] = []
+    fields: List[str] = []
+
+    def looks_like_row(a: List[Any]) -> bool:
+        if not a or len(a) < 5:
+            return False
+        code = str(a[0]).strip()
+        return code.isdigit() and 4 <= len(code) <= 6
+
+    for dk in sorted(data_keys):
+        cand = j.get(dk) or []
+        if cand and isinstance(cand, list) and looks_like_row(cand[0]):
+            rows = cand
+            fk = "fields" + dk.replace("data", "")
+            fields = j.get(fk) or []
+            break
+
+    if not rows:
+        return pd.DataFrame()
+
+    # Common MI_INDEX columns include:
+    # 證券代號, 證券名稱, 成交股數, 成交金額, 開盤價, 最高價, 最低價, 收盤價, 漲跌(+/-), 漲跌價差, ...
+    df = pd.DataFrame(rows, columns=fields if fields else None)
+    # Normalize column names to ASCII keys we can map
+    colmap = {}
+    for c in df.columns:
+        c2 = str(c).strip()
+        colmap[c] = c2
+    df.rename(columns=colmap, inplace=True)
+
+    def pick(*names: str) -> str:
+        for n in names:
+            if n in df.columns:
+                return n
+        return ""
+
+    c_code = pick("證券代號")
+    c_name = pick("證券名稱")
+    c_open = pick("開盤價")
+    c_high = pick("最高價")
+    c_low  = pick("最低價")
+    c_close = pick("收盤價")
+    c_vol = pick("成交股數")
+    c_chg_sign = pick("漲跌(+/-)")
+    c_chg = pick("漲跌價差")
+
+    if not c_code or not c_close:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["date"] = ymd
+    out["code"] = df[c_code].astype(str).str.strip()
+    out["name"] = df[c_name].astype(str).str.strip() if c_name else ""
+    # parse prices
+    def to_float(s: Any) -> float:
+        t = str(s).replace(",", "").strip()
+        if t in ("--", "---", ""):
+            return float("nan")
+        try:
+            return float(t)
+        except Exception:
+            return float("nan")
+
+    for key, src in [("open", c_open), ("high", c_high), ("low", c_low), ("close", c_close)]:
+        if src:
+            out[key] = df[src].map(to_float)
+
+    # volume (shares)
+    if c_vol:
+        def to_int(s: Any) -> int:
+            t = str(s).replace(",", "").strip()
+            if t in ("--", "---", ""):
+                return 0
+            try:
+                return int(float(t))
+            except Exception:
+                return 0
+        out["volume"] = df[c_vol].map(to_int)
+
+    # change_percent (approx) using diff and sign: prev_close = close - signed_diff
+    if c_chg and c_chg_sign and "close" in out.columns:
+        def signed_diff(row) -> float:
+            sign = str(row.get(c_chg_sign, "")).strip()
+            diff = to_float(row.get(c_chg, ""))
+            # sign can be "+", "-", "X" etc; treat '-' as negative
+            if sign == "-":
+                return -abs(diff)
+            if sign == "+":
+                return abs(diff)
+            # sometimes sign is "X" or " " meaning no change
+            return diff if not pd.isna(diff) else float("nan")
+
+        diffs = df.apply(signed_diff, axis=1)
+        close = out["close"]
+        prev = close - diffs
+        cp = (close - prev) / prev * 100.0
+        out["change_percent"] = cp.replace([float("inf"), float("-inf")], float("nan")).fillna(0.0)
+
+    out["exchange"] = "TWSE"
+    # filter: code digits length 4+
+    out = out[out["code"].str.match(r"^\d{4,6}$", na=False)].copy()
+    return out
+
+def fetch_tpex(ymd: str, timeout: int = 25) -> pd.DataFrame:
+    roc = ymd_to_roc_slash(ymd)
+    params = {"l": "zh-tw", "d": roc}
+    r = SESSION.get(TPEX_URL, params=params, timeout=timeout)
+    r.raise_for_status()
+    j = r.json()
+    rows = j.get("aaData") or []
+    if not rows:
+        return pd.DataFrame()
+
+    # aaData row example (common):
+    # [code, name, close, change, open, high, low, avg, volume, amount, trades, bid, bid_vol, ask, ask_vol, market_value, ...]
+    out = pd.DataFrame()
+    out["date"] = ymd
+    out["code"] = [str(x[0]).strip() for x in rows]
+    out["name"] = [str(x[1]).strip() for x in rows]
+
+    def to_float(s: Any) -> float:
+        t = str(s).replace(",", "").strip()
+        if t in ("--", "---", ""):
+            return float("nan")
+        try:
+            return float(t)
+        except Exception:
+            return float("nan")
+
+    def to_int(s: Any) -> int:
+        t = str(s).replace(",", "").strip()
+        if t in ("--", "---", ""):
+            return 0
+        try:
+            return int(float(t))
+        except Exception:
+            return 0
+
+    # indices per common format
+    close_i = 2
+    chg_i = 3
+    open_i = 4
+    high_i = 5
+    low_i = 6
+    vol_i = 8
+
+    out["close"] = [to_float(x[close_i]) if len(x) > close_i else float("nan") for x in rows]
+    out["open"]  = [to_float(x[open_i])  if len(x) > open_i  else float("nan") for x in rows]
+    out["high"]  = [to_float(x[high_i])  if len(x) > high_i  else float("nan") for x in rows]
+    out["low"]   = [to_float(x[low_i])   if len(x) > low_i   else float("nan") for x in rows]
+    out["volume"]= [to_int(x[vol_i])     if len(x) > vol_i   else 0 for x in rows]
+
+    # change_percent: use change amount + close => prev = close - change
+    diffs = [to_float(x[chg_i]) if len(x) > chg_i else float("nan") for x in rows]
+    prev = out["close"] - pd.Series(diffs)
+    cp = (out["close"] - prev) / prev * 100.0
+    out["change_percent"] = cp.replace([float("inf"), float("-inf")], float("nan")).fillna(0.0)
+
+    out["exchange"] = "TPEX"
+    out = out[out["code"].str.match(r"^\d{4,6}$", na=False)].copy()
+    return out
+
+def load_schema_cols() -> List[str]:
+    if not os.path.exists(OUT_MAIN):
+        # minimal fallback
+        return ["date","code","name","open","high","low","close","volume","change_percent","exchange"]
+    with open(OUT_MAIN, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+    return [h.strip() for h in header if h.strip()]
+
+def align_to_schema(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    out = pd.DataFrame()
+    for c in cols:
+        if c in df.columns:
+            out[c] = df[c]
+        else:
+            out[c] = ""
+    # enforce types for common cols if exist
+    for c in ("change_percent",):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    for c in ("volume",):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
+    return out
+
+def weekday_range(start: str, end: str):
+    s = datetime.strptime(start, "%Y-%m-%d").date()
+    e = datetime.strptime(end, "%Y-%m-%d").date()
+    d = s
+    while d <= e:
+        if d.weekday() < 5:
+            yield d
+        d += timedelta(days=1)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--start", required=True)
+    ap.add_argument("--end", required=True)
+    ap.add_argument("--timeout", type=int, default=25)
+    ap.add_argument("--sleep", type=float, default=0.6)
+    args = ap.parse_args()
+
+    cols = load_schema_cols()
+    print(f"[INFO] schema cols={len(cols)}")
+
+    new_frames = []
+    for d in weekday_range(args.start, args.end):
+        ymd = d.strftime("%Y-%m-%d")
+        print(f"[DATE] {ymd}")
+
+        tw = fetch_twse(ymd, timeout=args.timeout)
+        ot = fetch_tpex(ymd, timeout=args.timeout)
+
+        day = pd.concat([tw, ot], ignore_index=True)
+        if day.empty:
+            print(f"[WARN] no rows for {ymd}")
+            continue
+
+        day_aligned = align_to_schema(day, cols)
+        new_frames.append(day_aligned)
+
+        # polite delay
+        if args.sleep > 0:
+            import time
+            time.sleep(args.sleep)
+
+    if not new_frames:
+        raise RuntimeError("No backfill data produced.")
+
+    new_df = pd.concat(new_frames, ignore_index=True)
+
+    # load existing
+    if os.path.exists(OUT_MAIN):
+        old = pd.read_csv(OUT_MAIN, dtype={"code": str}, encoding="utf-8-sig")
+        old["date"] = old["date"].astype(str)
+        if "code" in old.columns:
+            old["code"] = old["code"].astype(str)
+        all_df = pd.concat([old, new_df], ignore_index=True)
+    else:
+        all_df = new_df
+
+    # de-dup by (date, code) if possible
+    if "date" in all_df.columns and "code" in all_df.columns:
+        all_df["date"] = all_df["date"].astype(str)
+        all_df["code"] = all_df["code"].astype(str)
+        all_df = all_df.drop_duplicates(["date","code"], keep="last")
+
+    all_df.to_csv(OUT_MAIN, index=False, encoding="utf-8-sig")
+    print(f"[DONE] wrote -> data/all_stocks_daily.csv rows={len(all_df)} dates={all_df['date'].nunique() if 'date' in all_df.columns else 'NA'}")
+
+if __name__ == "__main__":
+    main()

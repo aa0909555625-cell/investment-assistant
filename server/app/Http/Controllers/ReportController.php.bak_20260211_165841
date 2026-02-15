@@ -1,0 +1,35 @@
+﻿<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Support\Facades\DB;
+
+class ReportController extends Controller
+{
+    public function today()
+    {
+        $date = DB::table('daily_reports')
+            ->orderByDesc('date')
+            ->value('date');
+
+        if (!$date) {
+            abort(404, 'No report found');
+        }
+
+        return redirect()->route('report.show', ['date' => $date]);
+    }
+
+    public function show(string $date)
+    {
+        $report = DB::table('daily_reports')->where('date', $date)->first();
+        if (!$report) {
+            abort(404, 'Report not found');
+        }
+
+        return view('report.show', [
+            'date' => $report->date,
+            'top20' => json_decode($report->top20, true),
+            'ai_comment' => $report->ai_comment,
+        ]);
+    }
+}

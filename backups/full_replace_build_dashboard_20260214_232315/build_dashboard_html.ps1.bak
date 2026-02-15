@@ -1,0 +1,245 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)][string]$Date,
+  [int]$Capital = 300000,
+  [string]$ReportsDir = ".\reports",
+  [string]$OutDir = ".\reports",
+  [switch]$Open
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function SafeTrim([object]$v){ if($null -eq $v){""} else {([string]$v).Trim()} }
+function AsNumber([object]$v,[double]$default=0){
+  if($null -eq $v){ return $default }
+  $s = SafeTrim $v
+  if($s -eq ""){ return $default }
+  $d=0.0
+  if([double]::TryParse($s,[ref]$d)){ return $d }
+  $default
+}
+function HasProp([object]$obj,[string]$name){
+  if($null -eq $obj){ return $false }
+  ($obj.PSObject.Properties.Name -contains $name)
+}
+function HtmlEnc([object]$v){ [System.Net.WebUtility]::HtmlEncode((SafeTrim $v)) }
+function Money([object]$v){ "{0:N0}" -f ([math]::Round((AsNumber $v 0),0)) }
+function Pct([object]$v){
+  $n = AsNumber $v 0
+  if($n -ge 0 -and $n -le 1.2){ $n = $n * 100.0 }
+  "{0:N1}%" -f $n
+}
+function ReadJsonSafe([string]$p){
+  if(!(Test-Path $p)){ return $null }
+  try{ Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
+}
+function ReadTextSafe([string]$p){
+  if(!(Test-Path $p)){ return "" }
+  try{ Get-Content $p -Raw -Encoding UTF8 } catch { "" }
+}
+function ReadCsvSafe([string]$p){
+  if(!(Test-Path $p)){ return @() }
+  try{ @(Import-Csv $p -Encoding UTF8) } catch { @() }
+}
+function GetCsvField([object]$row,[string[]]$names,[string]$default=""){
+  foreach($n in $names){
+    if(HasProp $row $n){
+      $v = SafeTrim $row.$n
+      if($v -ne ""){ return $v }
+    }
+  }
+  $default
+}
+
+$ReportsDir = (Resolve-Path $ReportsDir).Path
+$OutDir     = (Resolve-Path $OutDir).Path
+
+$marketPath  = Join-Path $ReportsDir "market_overview.json"
+$sectorPath  = Join-Path $ReportsDir "sector_heat.csv"
+$summaryPath = Join-Path $ReportsDir "market_summary.md"
+$allocJson   = Join-Path $ReportsDir ("allocation_{0}.json" -f $Date)
+$allocCsv    = Join-Path $ReportsDir ("allocation_{0}.csv" -f $Date)
+
+$market    = ReadJsonSafe $marketPath
+$alloc     = ReadJsonSafe $allocJson
+$sectorTop = ReadCsvSafe  $sectorPath
+$summaryMd = ReadTextSafe $summaryPath
+
+# --- Market decision ---
+$decision="N/A"; $decisionNote=""
+if(($null -ne $market) -and (HasProp $market "decision")){
+  $d=$market.decision
+  if($null -ne $d){
+    if(HasProp $d "mode"){ $decision = SafeTrim $d.mode }
+    if(HasProp $d "note"){ $decisionNote = SafeTrim $d.note }
+  }
+}
+
+# --- Allocation ---
+$allocItems=@()
+$allocCashReserved=0
+$allocInvestable=0
+
+if($null -ne $alloc){
+  if(HasProp $alloc "items"){ $allocItems=@($alloc.items) }
+  if(HasProp $alloc "cash_reserved"){ $allocCashReserved = AsNumber $alloc.cash_reserved 0 }
+  if(HasProp $alloc "investable"){ $allocInvestable = AsNumber $alloc.investable 0 }
+}
+
+if(($allocItems.Count -eq 0) -and (Test-Path $allocCsv)){
+  foreach($r in (ReadCsvSafe $allocCsv)){
+    $allocItems += [pscustomobject]@{
+      code   = (GetCsvField $r @("code","Code") "")
+      name   = (GetCsvField $r @("name","Name") "")
+      bucket = (GetCsvField $r @("bucket","Bucket") "")
+      score  = (GetCsvField $r @("score","Score") "")
+      weight = (GetCsvField $r @("weight","Weight") "")
+      amount = (GetCsvField $r @("amount","Amount") "")
+      reason = (GetCsvField $r @("reason","Reason","note","Note") "")
+    }
+  }
+}
+
+$cashPct=""
+if($Capital -gt 0){
+  $cashPct = ("{0:N1}%" -f (100.0 * ($allocCashReserved / [double]$Capital)))
+}
+
+# --- Sector heat (ASCII-safe) ---
+$sectorRowsHtml=""
+$i=0
+foreach($s in $sectorTop){
+  $i++; if($i -gt 12){ break }
+  $sector  = GetCsvField $s @("sector","Sector","name","Name","sector_name") ""
+  $avg     = GetCsvField $s @("avg_pct","avg%","avg_percent","avg","avgPct","avgChange","avg_change","avg_chg") ""
+  $leaders = GetCsvField $s @("leaders","Leaders","top","Top","leader","Leader","leaders_list","top_list") ""
+  if($avg -match '^[+-]?\d+(\.\d+)?$'){ $avg = ("{0:N2}%" -f (AsNumber $avg 0)) }
+  $sectorRowsHtml += "<tr><td><b>$(HtmlEnc $sector)</b></td><td>$(HtmlEnc $avg)</td><td class='k'>$(HtmlEnc $leaders)</td></tr>"
+}
+if($sectorRowsHtml -eq ""){
+  $sectorRowsHtml = "<tr><td colspan='3' class='k'>sector_heat.csv not found or empty</td></tr>"
+}
+
+# --- Allocation rows ---
+$allocRows=""
+foreach($it in $allocItems){
+  $code   = HtmlEnc (SafeTrim $it.code)
+  $name   = HtmlEnc (SafeTrim $it.name)
+  $bucket = HtmlEnc (SafeTrim $it.bucket)
+  $score  = if(HasProp $it "score"){ ("{0:N2}" -f (AsNumber $it.score 0)) } else { "" }
+  $w      = if(HasProp $it "weight"){ Pct $it.weight } else { "" }
+  $amt    = if(HasProp $it "amount"){ Money $it.amount } else { "" }
+  $reason = HtmlEnc (SafeTrim $it.reason)
+  $allocRows += "<tr><td><b>$code</b></td><td>$name</td><td>$bucket</td><td>$score</td><td>$w</td><td>$amt</td><td class='k'>$reason</td></tr>"
+}
+if($allocRows -eq ""){
+  $allocRows = "<tr><td colspan='7' class='k'>No allocation items</td></tr>"
+}
+
+# --- Summary ---
+$summaryHtml=""
+if((SafeTrim $summaryMd) -ne ""){
+  $take=@()
+  foreach($ln in ($summaryMd -split "`r?`n")){
+    if($take.Count -ge 6){ break }
+    $t=$ln.Trim(); if($t -eq ""){ continue }
+    $take += ("<div class='k'>" + (HtmlEnc $t) + "</div>")
+  }
+  $summaryHtml = ($take -join "`n")
+}
+
+# --- CSS (no here-string) ---
+$cssLines = @(
+":root{--bg:#0b1020;--card:#121a33;--muted:#aab3d6;--text:#e9ecff;--line:#27305a}",
+"*{box-sizing:border-box}",
+"body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Arial,Helvetica,sans-serif}",
+".wrap{max-width:1180px;margin:0 auto;padding:18px}",
+".h1{font-size:22px;font-weight:700;margin:0 0 10px}",
+".sub{color:var(--muted);font-size:12px;margin:0 0 14px}",
+".grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}",
+".card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}",
+".k{color:var(--muted)}",
+".badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}",
+"table{width:100%;border-collapse:collapse}",
+"th,td{border-bottom:1px solid var(--line);padding:8px 6px;text-align:left;font-size:13px;vertical-align:top}",
+"th{color:var(--muted);font-weight:600}",
+"hr{border:0;border-top:1px solid var(--line);margin:12px 0}"
+)
+$css = ($cssLines -join "`n")
+
+$marketDecisionHtml = "<span class='badge'>$(HtmlEnc $decision)</span>"
+$meta = @("Date=$Date","Capital=$Capital")
+
+# --- HTML (StringBuilder) ---
+$sb = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine("<!doctype html>")
+[void]$sb.AppendLine("<html lang='en'>")
+[void]$sb.AppendLine("<head>")
+[void]$sb.AppendLine("<meta charset='utf-8'/>")
+[void]$sb.AppendLine("<meta name='viewport' content='width=device-width, initial-scale=1'/>")
+[void]$sb.AppendLine(("<title>Investment Dashboard {0}</title>" -f $Date))
+[void]$sb.AppendLine("<style>")
+[void]$sb.AppendLine($css)
+[void]$sb.AppendLine("</style>")
+[void]$sb.AppendLine("</head>")
+[void]$sb.AppendLine("<body>")
+[void]$sb.AppendLine("<div class='wrap'>")
+[void]$sb.AppendLine("<div class='h1'>Investment Dashboard</div>")
+[void]$sb.AppendLine(("<div class='sub'>{0}</div>" -f (HtmlEnc ($meta -join "  |  "))))
+[void]$sb.AppendLine("<div class='grid'>")
+
+# Card 1
+[void]$sb.AppendLine("<div class='card' style='grid-column:span 6;'>")
+[void]$sb.AppendLine("<div style='display:flex;justify-content:space-between;align-items:center;gap:10px;'>")
+[void]$sb.AppendLine("<div>")
+[void]$sb.AppendLine("<div style='font-weight:700;margin-bottom:6px;'>Market Mode</div>")
+[void]$sb.AppendLine(("<div>{0}</div>" -f $marketDecisionHtml))
+[void]$sb.AppendLine(("<div class='k' style='margin-top:6px;'>{0}</div>" -f (HtmlEnc $decisionNote)))
+[void]$sb.AppendLine("</div>")
+[void]$sb.AppendLine("<div style='text-align:right'>")
+[void]$sb.AppendLine("<div class='k'>Cash reserved</div>")
+[void]$sb.AppendLine(("<div style='font-size:20px;font-weight:800;'>{0}</div>" -f (Money $allocCashReserved)))
+[void]$sb.AppendLine(("<div class='k'>{0}</div>" -f $cashPct))
+[void]$sb.AppendLine("</div>")
+[void]$sb.AppendLine("</div>")
+[void]$sb.AppendLine("<hr/>")
+if($summaryHtml -ne ""){ [void]$sb.AppendLine($summaryHtml) } else { [void]$sb.AppendLine("<div class='k'>market_summary.md empty</div>") }
+[void]$sb.AppendLine("</div>")
+
+# Card 2
+[void]$sb.AppendLine("<div class='card' style='grid-column:span 6;'>")
+[void]$sb.AppendLine("<div style='font-weight:700;margin-bottom:8px;'>Sector Heat (Top)</div>")
+[void]$sb.AppendLine("<table>")
+[void]$sb.AppendLine("<thead><tr><th>Sector</th><th>Avg</th><th>Leaders</th></tr></thead>")
+[void]$sb.AppendLine(("<tbody>{0}</tbody>" -f $sectorRowsHtml))
+[void]$sb.AppendLine("</table>")
+[void]$sb.AppendLine("</div>")
+
+# Card 3
+[void]$sb.AppendLine("<div class='card' style='grid-column:span 12;'>")
+[void]$sb.AppendLine("<div style='display:flex;justify-content:space-between;align-items:end;gap:10px;'>")
+[void]$sb.AppendLine("<div style='font-weight:700;'>Allocation Plan</div>")
+[void]$sb.AppendLine(("<div class='k'>investable={0}  |  cash_reserved={1}</div>" -f (Money $allocInvestable),(Money $allocCashReserved)))
+[void]$sb.AppendLine("</div>")
+[void]$sb.AppendLine("<table style='margin-top:8px;'>")
+[void]$sb.AppendLine("<thead><tr><th>Code</th><th>Name</th><th>Bucket</th><th>Score</th><th>Weight</th><th>Amount</th><th>Reason</th></tr></thead>")
+[void]$sb.AppendLine("<tbody>")
+[void]$sb.AppendLine($allocRows)
+[void]$sb.AppendLine(("<tr><td><b>CASH</b></td><td class='k'>reserved</td><td class='k'>CASH</td><td></td><td>{0}</td><td><b>{1}</b></td><td class='k'>cash_reserved</td></tr>" -f $cashPct,(Money $allocCashReserved)))
+[void]$sb.AppendLine("</tbody>")
+[void]$sb.AppendLine("</table>")
+[void]$sb.AppendLine("</div>")
+
+[void]$sb.AppendLine("</div>") # grid
+[void]$sb.AppendLine("</div>") # wrap
+[void]$sb.AppendLine("</body>")
+[void]$sb.AppendLine("</html>")
+
+$outPath = Join-Path $OutDir ("dashboard_{0}.html" -f $Date)
+$utf8NoBom2 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($outPath, $sb.ToString().Replace("`r`n","`n").Replace("`n","`r`n"), $utf8NoBom2)
+
+Write-Host ("OK: wrote HTML -> {0}" -f $outPath) -ForegroundColor Green
+if($Open){ Start-Process $outPath | Out-Null }

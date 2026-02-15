@@ -1,0 +1,411 @@
+# -*- coding: utf-8 -*-
+"""
+market_pack_v1.py
+Step 7-6: Make "盤口更像看盤"
+- indices: TAIEX + TPEX (close, pct, trend, sma20/sma60, vol20)
+- breadth: adv/dec/flat/adv_ratio
+- decision: risk_mode/market_ok + signal_light + exposure_range + reasons + no_picks_reason
+- sector heat: from daily rows (+ optional sector_map)
+"""
+from __future__ import annotations
+import argparse, csv, json, math, os, sys
+from collections import defaultdict
+from datetime import datetime
+from statistics import mean, pstdev
+
+def _safe_float(x, default=0.0):
+    try:
+        if x is None: return default
+        s = str(x).strip().replace("%","")
+        if s == "": return default
+        return float(s)
+    except Exception:
+        return default
+
+def _safe_str(x, default=""):
+    if x is None: return default
+    return str(x).strip()
+
+def read_csv_rows(path: str):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+def write_json(path: str, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def write_csv(path: str, fieldnames, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+def write_text(path: str, text: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--in", dest="in_path", required=True, help="data/all_stocks_daily.csv")
+    p.add_argument("--outdir", default="reports", help="reports/")
+    p.add_argument("--date", default="", help="YYYY-MM-DD (default latest)")
+    p.add_argument("--sector_map", default="", help="data/sector_map.csv (code,sector)")
+    p.add_argument("--taiex_code", default="006204", help="default 006204 (from your dataset)")
+    p.add_argument("--tpex_code",  default="00928",  help="default 00928  (from your dataset)")
+    p.add_argument("--sector_top", type=int, default=20)
+    return p.parse_args()
+
+def load_sector_map(path: str):
+    if not path or not os.path.exists(path):
+        return {}
+    m = {}
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        # allow (code,sector) or (code,name,sector)
+        for row in r:
+            c = _safe_str(row.get("code"))
+            s = _safe_str(row.get("sector"))
+            if c and s:
+                m[c] = s
+    return m
+
+def get_latest_date(rows):
+    # expects 'date' in rows
+    ds = sorted({_safe_str(r.get("date")) for r in rows if _safe_str(r.get("date"))})
+    return ds[-1] if ds else ""
+
+def build_timeseries(rows, code: str):
+    # rows already include all dates; filter by code; sort by date
+    series = []
+    for r in rows:
+        if _safe_str(r.get("code")) == code:
+            d = _safe_str(r.get("date"))
+            cp = _safe_float(r.get("change_percent"), 0.0)
+            # NOTE: our dataset may not have "close"; we approximate close by cumulating pct onto 100 baseline per date order.
+            series.append((d, cp))
+    series.sort(key=lambda x: x[0])
+    return series
+
+def synth_close_from_change_pct(series):
+    # start at 100, apply (1+pct/100)
+    close = 100.0
+    out = []
+    for d, pct in series:
+        close *= (1.0 + pct/100.0)
+        out.append((d, close, pct))
+    return out
+
+def sma(vals, window):
+    if len(vals) < window:
+        return mean(vals) if vals else 0.0
+    return mean(vals[-window:])
+
+def vol(vals, window):
+    # pct volatility (std dev)
+    if not vals:
+        return 0.0
+    w = vals[-window:] if len(vals) >= window else vals[:]
+    if len(w) <= 1:
+        return 0.0
+    return pstdev(w)
+
+def classify_trend(close, sma20, sma60):
+    # simple: close above sma20 and sma20 above sma60 => up; close below sma20 and sma20 below sma60 => down; else sideways
+    if close >= sma20 and sma20 >= sma60:
+        return "up"
+    if close <= sma20 and sma20 <= sma60:
+        return "down"
+    return "sideways"
+
+def index_snapshot(all_rows, code: str, target_date: str):
+    # Build synthetic close series from change_percent for that code
+    series = build_timeseries(all_rows, code)
+    if not series:
+        return None
+    syn = synth_close_from_change_pct(series)
+    # pick last <= target_date
+    syn = [x for x in syn if x[0] <= target_date]
+    if not syn:
+        return None
+    d, close, pct = syn[-1]
+    closes = [x[1] for x in syn]
+    pcts = [x[2] for x in syn]
+    sma20 = sma(closes, 20)
+    sma60 = sma(closes, 60)
+    v20 = vol(pcts, 20)
+    trend = classify_trend(close, sma20, sma60)
+    return {
+        "code": code,
+        "date": d,
+        "close": round(close, 2),
+        "pct": float(pct),
+        "trend": trend,
+        "sma20": round(sma20, 4),
+        "sma60": round(sma60, 4),
+        "vol20": round(v20, 6),
+    }
+
+def breadth_snapshot(day_rows):
+    adv = 0
+    dec = 0
+    flat = 0
+    for r in day_rows:
+        pct = _safe_float(r.get("change_percent"), 0.0)
+        # treat missing/empty as flat
+        if pct > 0: adv += 1
+        elif pct < 0: dec += 1
+        else: flat += 1
+    denom = (adv + dec)
+    adv_ratio = (adv / denom) if denom > 0 else 0.0
+    return {
+        "adv": adv,
+        "dec": dec,
+        "flat": flat,
+        "adv_ratio": float(adv_ratio),
+    }
+
+def build_sector_heat(day_rows, sector_map, top_n: int):
+    # group by sector; compute avg pct and heat_score = avg_pct * log(1+n)
+    g = defaultdict(list)
+    leaders = defaultdict(list)
+
+    for r in day_rows:
+        code = _safe_str(r.get("code"))
+        name = _safe_str(r.get("name"))
+        sec = _safe_str(r.get("sector"))
+        if sector_map and code in sector_map:
+            sec = sector_map.get(code, sec)
+        sec = sec if sec else "UNKNOWN"
+        pct = _safe_float(r.get("change_percent"), 0.0)
+        g[sec].append(pct)
+        # keep top leaders by pct
+        leaders[sec].append((pct, code, name))
+
+    out = []
+    for sec, arr in g.items():
+        n = len(arr)
+        avg = mean(arr) if arr else 0.0
+        heat = (avg) * math.log(1.0 + n)
+        # leaders: top 3 pct
+        top3 = sorted(leaders[sec], key=lambda x: x[0], reverse=True)[:3]
+        lead_s = " | ".join([f"{c} {nm} ({p:+.2f}%)" for p, c, nm in top3])
+        out.append({
+            "sector": sec,
+            "n": n,
+            "avg_change_percent": float(avg),
+            "heat_score": float(heat),
+            "leaders": lead_s
+        })
+
+    out.sort(key=lambda r: r["heat_score"], reverse=True)
+    return out[:max(1, top_n)]
+
+def decide_regime(idx_taiex, idx_tpex, breadth):
+    # Inputs
+    adv_ratio = float(breadth.get("adv_ratio", 0.0))
+    trend_up = 0
+    trend_down = 0
+    mixed = 0
+
+    for idx in (idx_taiex, idx_tpex):
+        if not idx: 
+            mixed += 1
+            continue
+        t = _safe_str(idx.get("trend")).lower()
+        if t == "up": trend_up += 1
+        elif t == "down": trend_down += 1
+        else: mixed += 1
+
+    # volatility proxy: mean of vol20
+    vols = []
+    for idx in (idx_taiex, idx_tpex):
+        if idx: vols.append(_safe_float(idx.get("vol20"), 0.0))
+    vol20 = mean(vols) if vols else 0.0
+
+    # market_ok baseline
+    trend_ok = (trend_down == 0) and (trend_up >= 1)
+    breadth_ok = adv_ratio >= 0.50
+    market_ok = bool(trend_ok and breadth_ok)
+
+    reasons = []
+    reasons.append(f"breadth adv_ratio={adv_ratio:.3f}")
+    reasons.append(f"trend up={trend_up} down={trend_down} mixed={mixed}")
+    reasons.append(f"vol20{vol20:.4f} (pct std)")
+
+    # risk_mode + signal_light
+    # conservative triggers
+    if (trend_down >= 1) or (adv_ratio < 0.48):
+        risk_mode = "conservative"
+        signal = "red"
+    # aggressive triggers
+    elif (trend_up == 2) and (adv_ratio >= 0.55) and (vol20 <= 2.0):
+        risk_mode = "aggressive"
+        signal = "green"
+    else:
+        risk_mode = "normal"
+        signal = "yellow" if (adv_ratio < 0.52 or mixed > 0) else "green"
+
+    # exposure range
+    if risk_mode == "conservative":
+        exp_min, exp_max = 0.20, 0.40
+        posture = "保守"
+        action = "減碼/低曝險；只做高勝率訊號，嚴格停損。"
+    elif risk_mode == "aggressive":
+        exp_min, exp_max = 0.70, 0.90
+        posture = "積極"
+        action = "順勢加碼；分批進場，維持風控與停損。"
+    else:
+        exp_min, exp_max = 0.40, 0.70
+        posture = "正常"
+        action = "依訊號分批；避免追高，停損嚴格。"
+
+    # no picks reason (human readable)
+    if not market_ok:
+        no_picks_reason = "market_ok=false：市場條件未達門檻（趨勢/廣度其一不符），今日可能出現 0 picks 屬正常防守行為。"
+    else:
+        no_picks_reason = "market_ok=true 但仍可能 0 picks：代表個股訊號門檻較嚴格或樣本資料不足，建議耐心等下一個有效訊號日。"
+
+    return {
+        "risk_mode": risk_mode,
+        "market_ok": market_ok,
+        "signal_light": signal,                 # green/yellow/red
+        "posture": posture,                     # 保守/正常/積極
+        "suggested_action": action,
+        "suggested_exposure": {
+            "min": exp_min,
+            "max": exp_max
+        },
+        "breadth_ratio": adv_ratio,
+        "trend_up_count": trend_up,
+        "trend_down_count": trend_down,
+        "reasons": reasons,
+        "no_picks_reason": no_picks_reason,
+    }
+
+def main():
+    args = parse_args()
+    in_path = args.in_path
+    outdir = args.outdir
+    if not os.path.exists(in_path):
+        raise SystemExit(f"Input not found: {in_path}")
+
+    all_rows = read_csv_rows(in_path)
+    target_date = args.date.strip() or get_latest_date(all_rows)
+    if not target_date:
+        raise SystemExit("No date found in input CSV.")
+
+    day_rows = [r for r in all_rows if _safe_str(r.get("date")) == target_date]
+
+    # apply sector_map
+    sector_map = load_sector_map(args.sector_map)
+
+    # indices
+    idx_taiex = index_snapshot(all_rows, args.taiex_code, target_date)
+    idx_tpex  = index_snapshot(all_rows, args.tpex_code,  target_date)
+
+    indices = {}
+    if idx_taiex: indices["TAIEX"] = idx_taiex
+    if idx_tpex:  indices["TPEX"]  = idx_tpex
+
+    # breadth
+    breadth = breadth_snapshot(day_rows)
+
+    # decision
+    decision = decide_regime(idx_taiex, idx_tpex, breadth)
+
+    # sector heat
+    sector_heat = build_sector_heat(day_rows, sector_map, args.sector_top)
+
+    # outputs
+    market_overview = {
+        "date": target_date,
+        "indices": indices,
+        "breadth": breadth,
+        "decision": decision,
+        "notes": {
+            "index_detection": {
+                "taiex_code": args.taiex_code,
+                "tpex_code": args.tpex_code
+            },
+            "sector_map": {
+                "enabled": bool(sector_map),
+                "rows": len(sector_map)
+            }
+        }
+    }
+
+    out_market = os.path.join(outdir, "market_overview.json")
+    out_sector = os.path.join(outdir, "sector_heat.csv")
+    out_md     = os.path.join(outdir, "market_summary.md")
+
+    write_json(out_market, market_overview)
+
+    # sector heat csv
+    write_csv(out_sector,
+              ["sector","n","avg_change_percent","heat_score","leaders"],
+              [{
+                  "sector": r["sector"],
+                  "n": r["n"],
+                  "avg_change_percent": f'{r["avg_change_percent"]:.12g}',
+                  "heat_score": f'{r["heat_score"]:.12g}',
+                  "leaders": r["leaders"]
+              } for r in sector_heat])
+
+    # markdown summary (more decision-feel)
+    lines = []
+    lines.append(f"# 盤口摘要（{target_date}）")
+    lines.append("")
+    lines.append("## 指數")
+    if "TAIEX" in indices:
+        i = indices["TAIEX"]
+        lines.append(f'- TAIEX ({i["code"]})  收盤 {i["close"]:.2f}  漲跌 {i["pct"]:+.2f}%  趨勢 {i["trend"]}')
+    else:
+        lines.append("- TAIEX：N/A")
+    if "TPEX" in indices:
+        i = indices["TPEX"]
+        lines.append(f'- TPEX ({i["code"]})  收盤 {i["close"]:.2f}  漲跌 {i["pct"]:+.2f}%  趨勢 {i["trend"]}')
+    else:
+        lines.append("- TPEX：N/A")
+    lines.append("")
+    lines.append("## 市場廣度（Breadth）")
+    lines.append(f'- 上漲家數 adv = {breadth["adv"]}')
+    lines.append(f'- 下跌家數 dec = {breadth["dec"]}')
+    lines.append(f'- 持平/缺值 flat = {breadth["flat"]}')
+    lines.append(f'- adv_ratio（上漲/上+下） = {breadth["adv_ratio"]*100:.1f}%')
+    lines.append("")
+    lines.append("## 交易決策（Step 7-6）")
+    lines.append(f'- signal_light = **{decision["signal_light"]}** （green/yellow/red）')
+    lines.append(f'- risk_mode = **{decision["risk_mode"]}**（{decision["posture"]}）')
+    lines.append(f'- market_ok = **{str(decision["market_ok"]).lower()}**')
+    lines.append(f'- 建議曝險 = **{decision["suggested_exposure"]["min"]:.0%} ~ {decision["suggested_exposure"]["max"]:.0%}**')
+    lines.append(f'- 建議動作：{decision["suggested_action"]}')
+    lines.append("")
+    lines.append("### 判斷依據（Reasons）")
+    for r in decision.get("reasons", []):
+        lines.append(f"- {r}")
+    lines.append("")
+    lines.append("### 今日 0 picks 時的解釋")
+    lines.append(f"- {decision.get('no_picks_reason','')}")
+    lines.append("")
+    lines.append("## 類股熱度（Top 10）")
+    for i, r in enumerate(sector_heat[:10], start=1):
+        lines.append(f'{i}. **{r["sector"]}**  n={r["n"]}  avg={r["avg_change_percent"]:+.2f}%  heat={r["heat_score"]:.3f}')
+        if r["leaders"]:
+            lines.append(f'   - leaders: {r["leaders"]}')
+    lines.append("")
+    lines.append("---")
+    lines.append("generated by market_pack_v1.py (Step 7-6)")
+
+    write_text(out_md, "\n".join(lines) + "\n")
+
+    print(f"[OK] wrote -> {out_market}")
+    print(f"[OK] wrote -> {out_sector}")
+    print(f"[OK] wrote -> {out_md}")
+
+if __name__ == "__main__":
+    main()

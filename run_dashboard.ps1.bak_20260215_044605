@@ -1,0 +1,75 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [switch]$Open
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Resolve-ProjectRoot {
+  $here = Get-Location
+  return $here.Path
+}
+
+function Resolve-PythonExe {
+  $venv = Join-Path (Resolve-ProjectRoot) ".\.venv\Scripts\python.exe"
+  if(Test-Path $venv){ return (Resolve-Path $venv).Path }
+  return "python"
+}
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  $Date = (Get-Date -Format "yyyy-MM-dd")
+}
+
+$root = Resolve-ProjectRoot
+$py = Resolve-PythonExe
+
+$reportsDir = Join-Path $root ".\reports"
+if(!(Test-Path $reportsDir)){
+  New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
+}
+
+$dataCsv = Join-Path $root ".\data\all_stocks_daily.csv"
+if(!(Test-Path $dataCsv)){
+  Write-Host "WARN: missing data CSV -> $dataCsv (snapshot may still work if script doesn't require it)" -ForegroundColor Yellow
+}
+
+Write-Host "=== RUN DASHBOARD (Phase C) ===" -ForegroundColor Cyan
+Write-Host ("Date={0} Capital={1} Top={2} Open={3}" -f $Date, $Capital, $Top, $Open.IsPresent)
+
+# 1) PhaseC snapshot (IMPORTANT: only pass supported args)
+$snapshotScript = Join-Path $root ".\scripts\phaseC_market_snapshot.py"
+if(!(Test-Path $snapshotScript)){ throw "Missing script: $snapshotScript" }
+
+$args1 = @(
+  $snapshotScript,
+  "--date", $Date,
+  "--top",  ([string]$Top),
+  "--outdir", $reportsDir,
+  "--data_csv", $dataCsv
+)
+
+& $py @args1
+if($LASTEXITCODE -ne 0){ throw "phaseC_market_snapshot.py failed." }
+
+# 2) Build dashboard HTML
+$builder = Join-Path $root ".\scripts\build_dashboard_html.ps1"
+if(!(Test-Path $builder)){ throw "Missing builder: $builder" }
+
+$args2 = @(
+  "-Date", $Date,
+  "-Capital", ([string]$Capital),
+  "-Top", ([string]$Top),
+  "-OutDir", $reportsDir
+)
+
+if($Open){ $args2 += "-Open" }
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $builder @args2
+if($LASTEXITCODE -ne 0){ throw "build_dashboard_html.ps1 failed." }
+
+Write-Host "DONE." -ForegroundColor Green

@@ -1,0 +1,323 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [string]$OutDir = ".\reports",
+  [string]$Root = ".",
+  [string]$ReportsDir = ".\reports",
+  [int]$TopSectors = 10,
+  [switch]$Open
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function SafeTrim([object]$v){
+  if($null -eq $v){ return "" }
+  return ($v.ToString()).Trim()
+}
+
+function HtmlEnc([string]$s){
+  return [System.Net.WebUtility]::HtmlEncode($s)
+}
+
+function HasProp([object]$o, [string]$name){
+  if($null -eq $o){ return $false }
+  $p = $o.PSObject.Properties.Match($name)
+  return ($p -ne $null -and $p.Count -gt 0)
+}
+
+function GetCsvField([object]$row, [string[]]$names){
+  foreach($n in $names){
+    if(HasProp $row $n){
+      $v = $row.PSObject.Properties[$n].Value
+      $s = SafeTrim $v
+      if($s -ne ""){ return $s }
+    }
+  }
+  return ""
+}
+
+function AsNumber([object]$v, [double]$default){
+  if($null -eq $v){ return $default }
+  $s = (SafeTrim $v)
+  if($s -eq ""){ return $default }
+  $n = 0.0
+  if([double]::TryParse($s, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$n)){
+    return $n
+  }
+  return $default
+}
+
+function Money([object]$v){
+  $n = AsNumber $v 0
+  return ("{0:N0}" -f $n)
+}
+
+function Pct([object]$v){
+  $n = AsNumber $v 0
+  return ("{0:P2}" -f $n)
+}
+
+function ReadJson([string]$path){
+  if(!(Test-Path $path)){ return $null }
+  return (Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json)
+}
+
+function ReadLines([string]$path){
+  if(!(Test-Path $path)){ return @() }
+  return (Get-Content $path -Encoding UTF8)
+}
+
+function ReadCsv([string]$path){
+  if(!(Test-Path $path)){ return @() }
+  return (Import-Csv $path -Encoding UTF8)
+}
+
+# -------- resolve date --------
+if([string]::IsNullOrWhiteSpace($Date)){
+  $allocFiles = Get-ChildItem -Path $ReportsDir -Filter "allocation_*.json" -ErrorAction SilentlyContinue | Sort-Object Name
+  if($allocFiles -and $allocFiles.Count -gt 0){
+    $m = [regex]::Match($allocFiles[-1].Name, "allocation_(\d{4}-\d{2}-\d{2})\.json")
+    if($m.Success){ $Date = $m.Groups[1].Value }
+  }
+}
+if([string]::IsNullOrWhiteSpace($Date)){
+  throw "Date is empty and cannot be inferred. Provide -Date YYYY-MM-DD."
+}
+
+# -------- inputs --------
+$marketPath  = Join-Path $ReportsDir "market_overview.json"
+$sectorPath  = Join-Path $ReportsDir "sector_heat.csv"
+$summaryPath = Join-Path $ReportsDir "market_summary.md"
+$allocPath   = Join-Path $ReportsDir ("allocation_{0}.json" -f $Date)
+$pfSumPath   = Join-Path $ReportsDir "portfolio_backtest_v3_summary.json"
+
+$market = ReadJson $marketPath
+$alloc  = ReadJson $allocPath
+$pfSum  = ReadJson $pfSumPath
+$sectors = ReadCsv $sectorPath
+$summaryLines = ReadLines $summaryPath
+
+# -------- market card --------
+$riskMode = ""
+$actionText = ""
+$tw = $null
+$otc = $null
+
+if($null -ne $market){
+  if(HasProp $market "decision"){
+    $d = $market.decision
+    if($null -ne $d){
+      if(HasProp $d "risk_mode"){ $riskMode = SafeTrim $d.risk_mode }
+      if(HasProp $d "action"){ $actionText = SafeTrim $d.action }
+    }
+  }
+  if(HasProp $market "index"){
+    $idx = $market.index
+    if($null -ne $idx){
+      if(HasProp $idx "TAIEX"){ $tw = $idx.TAIEX }
+      if(HasProp $idx "TPEX"){ $otc = $idx.TPEX }
+    }
+  }
+}
+
+# -------- breadth --------
+$adv=0; $dec=0; $flat=0; $advRatio=0.0
+if(($null -ne $market) -and (HasProp $market "breadth")){
+  $b = $market.breadth
+  if($null -ne $b){
+    if(HasProp $b "adv"){ $adv = [int](AsNumber $b.adv 0) }
+    if(HasProp $b "dec"){ $dec = [int](AsNumber $b.dec 0) }
+    if(HasProp $b "flat"){ $flat = [int](AsNumber $b.flat 0) }
+    if(HasProp $b "adv_ratio"){ $advRatio = AsNumber $b.adv_ratio 0 }
+  }
+}
+
+# -------- allocation --------
+$items = @()
+$exposureTarget = 0.0
+$cashReserved = 0
+$investable = 0
+
+if($null -ne $alloc){
+  if(HasProp $alloc "items"){ $items = @($alloc.items) }
+  if(HasProp $alloc "exposure_target"){ $exposureTarget = AsNumber $alloc.exposure_target 0 }
+  if(HasProp $alloc "cash_reserved"){ $cashReserved = [int](AsNumber $alloc.cash_reserved 0) }
+  if(HasProp $alloc "investable"){ $investable = [int](AsNumber $alloc.investable 0) }
+}
+
+if($investable -le 0){
+  $investable = [int]([math]::Round($Capital * $exposureTarget, 0))
+}
+$cashPct = 0.0
+if($Capital -gt 0){
+  $cashPct = ($Capital - $investable) / [double]$Capital
+}
+$allocCash = ($Capital - $investable)
+
+# -------- sector heat top N --------
+$sectorTop = @()
+if($sectors -and $sectors.Count -gt 0){
+  $sectorTop = $sectors | Select-Object -First $TopSectors
+}
+
+# -------- portfolio summary --------
+$pfPeriodStart=""; $pfPeriodEnd=""; $pfCagr=""; $pfMaxdd=""; $pfWinrate=""; $pfTrades=""
+if($null -ne $pfSum){
+  if(HasProp $pfSum "period_start"){ $pfPeriodStart = SafeTrim $pfSum.period_start }
+  if(HasProp $pfSum "period_end"){ $pfPeriodEnd = SafeTrim $pfSum.period_end }
+  if(HasProp $pfSum "cagr"){ $pfCagr = ("{0:P2}" -f (AsNumber $pfSum.cagr 0)) }
+  if(HasProp $pfSum "max_drawdown"){ $pfMaxdd = ("{0:P2}" -f (AsNumber $pfSum.max_drawdown 0)) }
+  if(HasProp $pfSum "win_rate"){ $pfWinrate = ("{0:P2}" -f (AsNumber $pfSum.win_rate 0)) }
+  if(HasProp $pfSum "trades"){ $pfTrades = ("{0:N0}" -f (AsNumber $pfSum.trades 0)) }
+}
+
+# -------- build allocation table rows --------
+$allocRows = ""
+foreach($it in $items){
+  $code   = HtmlEnc (SafeTrim $it.code)
+  $name   = HtmlEnc (SafeTrim $it.name)
+  $bucket = if(HasProp $it "bucket"){ HtmlEnc (SafeTrim $it.bucket) } else { "?" }
+  $score  = if(HasProp $it "score"){ ("{0:N2}" -f (AsNumber $it.score 0)) } else { "" }
+  $w      = if(HasProp $it "weight"){ Pct $it.weight } else { "" }
+  $amt    = if(HasProp $it "amount"){ Money $it.amount } else { "" }
+  $reason = if(HasProp $it "reason"){ HtmlEnc (SafeTrim $it.reason) } else { "" }
+
+  $allocRows += "<tr><td><b>$code</b></td><td>$name</td><td>$bucket</td><td>$score</td><td>$w</td><td>$amt</td><td class='k'>$reason</td></tr>`n"
+}
+$allocRows += "<tr><td><b>CASH</b></td><td class='k'>reserved</td><td class='k'>CASH</td><td></td><td>$(Pct $cashPct)</td><td><b>$(Money $allocCash)</b></td><td class='k'>cash_reserved</td></tr>`n"
+
+# -------- index lines --------
+function IndexLine([string]$label, $obj){
+  if($null -eq $obj){ return "" }
+  $close = if(HasProp $obj "close"){ ("{0:N2}" -f (AsNumber $obj.close 0)) } else { "" }
+  $chg   = if(HasProp $obj "change_pct"){ ("{0:P2}" -f (AsNumber $obj.change_pct 0)) } elseif(HasProp $obj "change"){ SafeTrim $obj.change } else { "" }
+  $trend = if(HasProp $obj "trend"){ HtmlEnc (SafeTrim $obj.trend) } else { "" }
+  return "<div class='small'><span class='badge'>$label</span> close <b>$close</b> &nbsp; change <b>$chg</b> &nbsp; trend <b>$trend</b></div>"
+}
+$idxTw  = IndexLine "TAIEX" $tw
+$idxOtc = IndexLine "TPEX"  $otc
+
+# -------- sector rows (SAFE CSV FIELDS) --------
+$sectorRows = ""
+$k = 0
+foreach($s in $sectorTop){
+  $k++
+
+  $sector = HtmlEnc (GetCsvField $s @("leaders","Leaders","top","Top","leader","Leader","leaders_list","top_list")
+  if($sector -eq ""){ $sector = "?" }
+
+  $n = GetCsvField $s @("n","N","count","Count","stocks","Stocks","成分數")
+  $avg = GetCsvField $s @("avg_pct","avg%","avg_percent","avg","avgPct","avgChange","avg_change","平均漲跌","avg_chg")
+
+  # normalize avg to percent display if numeric
+  if($avg -match '^[+-]?\d+(\.\d+)?$'){
+    $avg = ("{0:N2}%" -f (AsNumber $avg 0))
+  }
+
+  $heat = GetCsvField $s @("heat","Heat","score","Score","rank_score","熱度")
+  $leaders = HtmlEnc (GetCsvField $s @("leaders","Leaders","top","Top","leader","Leader","leaders_list","top_list")
+  $sectorRows += "<tr><td>$k</td><td><b>$sector</b></td><td>$n</td><td>$avg</td><td>$heat</td><td>$leaders</td></tr>`n"
+}
+
+# -------- HTML --------
+$css = @"
+:root{ --bg:#0b1020; --card:#121a33; --muted:#aab3d6; --text:#e9ecff; --line:rgba(255,255,255,.08); }
+*{ box-sizing:border-box; }
+body{ margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:var(--bg); color:var(--text); }
+.wrap{ max-width:1100px; margin:20px auto; padding:0 16px; }
+.h1{ font-size:22px; font-weight:700; margin:4px 0 14px; }
+.grid{ display:grid; grid-template-columns: repeat(12,1fr); gap:12px; }
+.card{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; }
+.k{ color:var(--muted); font-size:12px; }
+.v{ font-size:18px; font-weight:700; margin-top:2px; }
+.small{ font-size:12px; color:var(--muted); margin-top:6px; line-height:1.5; }
+.badge{ display:inline-block; padding:4px 10px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:rgba(255,255,255,.05); }
+.tbl{ width:100%; border-collapse:collapse; margin-top:8px; }
+.tbl th,.tbl td{ border-bottom:1px solid var(--line); padding:8px 6px; font-size:12px; text-align:left; vertical-align:top; }
+.tbl th{ color:var(--muted); font-weight:600; }
+.hr{ height:1px; background:var(--line); margin:10px 0; }
+"@
+
+if([string]::IsNullOrWhiteSpace($riskMode)){ $riskMode = "normal" }
+$actionHtml = HtmlEnc $actionText
+
+$html = @"
+<!doctype html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Investment Dashboard $Date</title>
+<style>$css</style>
+</head>
+<body>
+<div class='wrap'>
+  <div class='h1'>Investment Dashboard <span class='k'>($Date)</span></div>
+
+  <div class='grid'>
+    <div class='card' style='grid-column: span 6;'>
+      <div class='k'>Market</div>
+      <div class='v'>Risk Mode: <span class='badge'>$riskMode</span></div>
+      <div class='small'>$actionHtml</div>
+      <div class='hr'></div>
+      $idxTw
+      $idxOtc
+    </div>
+
+    <div class='card' style='grid-column: span 3;'>
+      <div class='k'>Breadth</div>
+      <div class='v'>Adv/Dec</div>
+      <div class='small'>adv=<b>$adv</b> &nbsp; dec=<b>$dec</b> &nbsp; flat=<b>$flat</b></div>
+      <div class='small'>adv_ratio=<b>$(("{0:P2}" -f $advRatio))</b></div>
+    </div>
+
+    <div class='card' style='grid-column: span 3;'>
+      <div class='k'>Capital Allocation</div>
+      <div class='v'>Exposure <b>$(Pct $exposureTarget)</b></div>
+      <div class='small'>Capital=<b>$(Money $Capital)</b> &nbsp; Investable=<b>$(Money $investable)</b></div>
+      <div class='small'>Cash Reserved=<b>$(Money $allocCash)</b> &nbsp; Cash%=<b>$(Pct $cashPct)</b></div>
+    </div>
+
+    <div class='card' style='grid-column: span 12;'>
+      <div class='k'>Allocation Items</div>
+      <table class='tbl'>
+        <thead><tr><th>Code</th><th>Name</th><th>Bucket</th><th>Score</th><th>Weight</th><th>Amount</th><th>Reason</th></tr></thead>
+        <tbody>
+          $allocRows
+        </tbody>
+      </table>
+    </div>
+
+    <div class='card' style='grid-column: span 12;'>
+      <div class='k'>Sector Heat (Top $TopSectors)</div>
+      <table class='tbl'>
+        <thead><tr><th>#</th><th>Sector</th><th>N</th><th>Avg Chg</th><th>Heat</th><th>Leaders</th></tr></thead>
+        <tbody>
+          $sectorRows
+        </tbody>
+      </table>
+    </div>
+
+    <div class='card' style='grid-column: span 12;'>
+      <div class='k'>Portfolio Backtest v3 Summary</div>
+      <div class='small'>Period: <b>$pfPeriodStart</b>  <b>$pfPeriodEnd</b></div>
+      <div class='small'>CAGR: <b>$pfCagr</b> &nbsp; MaxDD: <b>$pfMaxdd</b> &nbsp; WinRate: <b>$pfWinrate</b> &nbsp; Trades: <b>$pfTrades</b></div>
+      <div class='small k'>Files: market_overview.json / sector_heat.csv / allocation_$Date.json / portfolio_backtest_v3_summary.json</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
+"@
+
+# -------- write --------
+if(!(Test-Path $OutDir)){ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
+$outPath = Join-Path $OutDir ("dashboard_{0}.html" -f $Date)
+
+[System.IO.File]::WriteAllText((Resolve-Path $outPath).Path, $html.Replace("`r`n","`n").Replace("`n","`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+Write-Host ("OK: wrote HTML -> {0}" -f (Resolve-Path $outPath).Path) -ForegroundColor Green
+
+if($Open){ Start-Process (Resolve-Path $outPath).Path | Out-Null }

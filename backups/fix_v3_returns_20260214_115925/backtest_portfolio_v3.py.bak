@@ -1,0 +1,220 @@
+# -*- coding: utf-8 -*-
+"""
+Portfolio Backtest v3 (C-mode risk switch, costs, dynamic holdings)
+
+Risk switch (C-mode, v0.9 hardened):
+- trend_ok from data/market_snapshot_taiex.csv (per date)
+- breadth metric from data/breadth_history.csv:
+    --breadth_field adv_ratio (default) or breadth_ratio
+- market_ok := trend_ok AND (breadth_metric >= --breadth_min)
+- risk_mode := RISK_ON if market_ok else RISK_OFF
+
+Notes:
+- We evaluate signal on d0 (prev_date) and apply return on d1 to avoid lookahead.
+"""
+
+from __future__ import annotations
+import argparse, json, os, math
+from typing import Dict, List
+
+import pandas as pd
+import numpy as np
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+def read_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, dtype={"code": str, "date": str, "source": str}, low_memory=False, encoding="utf-8-sig")
+
+def write_placeholder(out_csv: str, out_json: str, init_capital: float, note: str):
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    cols = ["date","prev_date","risk_mode","market_ok","trend_ok","breadth_metric","holdings","turnover","gross_return","cost_frac","equity"]
+    pd.DataFrame([], columns=cols).to_csv(out_csv, index=False, encoding="utf-8-sig")
+    summ = {
+        "init_capital": float(init_capital),
+        "final_equity": float(init_capital),
+        "total_return": 0.0,
+        "annualized_return": 0.0,
+        "max_drawdown": 0.0,
+        "sharpe": 0.0,
+        "bars": 0,
+        "note": note,
+    }
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(summ, f, ensure_ascii=False, indent=2)
+
+def calc_summary(equity: List[float], init_capital: float, bars: int) -> Dict:
+    eq = np.array(equity, dtype=float)
+    final_eq = float(eq[-1]) if len(eq) else float(init_capital)
+    total_ret = (final_eq / init_capital) - 1.0 if init_capital > 0 else 0.0
+    ann = (1.0 + total_ret) ** (252.0 / bars) - 1.0 if bars > 0 else 0.0
+
+    if len(eq) > 0:
+        peak = np.maximum.accumulate(eq)
+        dd = (eq / peak) - 1.0
+        mdd = float(dd.min())
+    else:
+        mdd = 0.0
+
+    if len(eq) > 2:
+        rets = (eq[1:] / eq[:-1]) - 1.0
+        mu = rets.mean()
+        sd = rets.std(ddof=1)
+        sharpe = float((mu / sd) * math.sqrt(252.0)) if sd > 0 else 0.0
+    else:
+        sharpe = 0.0
+
+    return {
+        "init_capital": float(init_capital),
+        "final_equity": float(final_eq),
+        "total_return": float(total_ret),
+        "annualized_return": float(ann),
+        "max_drawdown": float(mdd),
+        "sharpe": float(sharpe),
+        "bars": int(bars),
+    }
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_csv", default=r"data/all_stocks_daily.csv")
+    ap.add_argument("--market_csv", default=r"data/market_snapshot_taiex.csv")
+    ap.add_argument("--breadth_csv", default=r"data/breadth_history.csv")
+    ap.add_argument("--out_csv", default=r"reports/portfolio_backtest_v3.csv")
+    ap.add_argument("--out_json", default=r"reports/portfolio_backtest_v3_summary.json")
+
+    ap.add_argument("--start", default="")
+    ap.add_argument("--end", default="")
+    ap.add_argument("--init_capital", type=float, default=1000000.0)
+
+    ap.add_argument("--holdings_on", type=int, default=15)
+    ap.add_argument("--holdings_off", type=int, default=0)
+    ap.add_argument("--cost_bps", type=float, default=25.0)
+
+    ap.add_argument("--breadth_field", default="adv_ratio", choices=["adv_ratio","breadth_ratio"])
+    ap.add_argument("--breadth_min", type=float, default=0.50)
+
+    # backward compat: ignore safely
+    ap.add_argument("--threshold", type=float, default=None)
+
+    args = ap.parse_args()
+
+    in_csv = os.path.join(ROOT, args.in_csv)
+    mkt_csv = os.path.join(ROOT, args.market_csv)
+    br_csv = os.path.join(ROOT, args.breadth_csv)
+    out_csv = os.path.join(ROOT, args.out_csv)
+    out_json = os.path.join(ROOT, args.out_json)
+
+    df = read_csv(in_csv)
+    need = {"date","code","total_score","change_percent"}
+    if not need.issubset(set(df.columns)):
+        raise ValueError(f"{args.in_csv} must contain: {sorted(list(need))}")
+
+    df["date"] = df["date"].astype(str)
+    df["code"] = df["code"].astype(str)
+    df["total_score"] = pd.to_numeric(df["total_score"], errors="coerce")
+    df["change_percent"] = pd.to_numeric(df["change_percent"], errors="coerce")
+
+    dates = sorted(df["date"].dropna().unique().tolist())
+    if args.start.strip():
+        dates = [d for d in dates if d >= args.start.strip()]
+    if args.end.strip():
+        dates = [d for d in dates if d <= args.end.strip()]
+
+    if len(dates) < 2:
+        write_placeholder(out_csv, out_json, args.init_capital, note=f"Need >=2 trading dates. Found {len(dates)} date(s): {dates[:5]}")
+        return
+
+    if not os.path.exists(mkt_csv):
+        write_placeholder(out_csv, out_json, args.init_capital, note="Missing market_snapshot_taiex.csv")
+        return
+
+    mkt = read_csv(mkt_csv)
+    mkt["date"] = mkt["date"].astype(str)
+    if "trend_ok" in mkt.columns:
+        mkt["trend_ok"] = mkt["trend_ok"].astype(str).str.lower().isin(["true","1","yes"])
+    else:
+        mkt["trend_ok"] = False
+    trend_map = {r["date"]: bool(r["trend_ok"]) for _, r in mkt.iterrows()}
+
+    breadth_map: Dict[str, float] = {}
+    if os.path.exists(br_csv):
+        br = read_csv(br_csv)
+        if {"date", args.breadth_field}.issubset(set(br.columns)):
+            br["date"] = br["date"].astype(str)
+            br[args.breadth_field] = pd.to_numeric(br[args.breadth_field], errors="coerce").fillna(0.0)
+            breadth_map = {r["date"]: float(r[args.breadth_field]) for _, r in br.iterrows()}
+
+    equity = [float(args.init_capital)]
+    rows = []
+    cost_frac = (args.cost_bps / 10000.0)
+
+    for i in range(len(dates) - 1):
+        d0 = dates[i]
+        d1 = dates[i + 1]
+
+        day0 = df[df["date"] == d0].dropna(subset=["total_score","change_percent"]).copy()
+        if day0.empty:
+            rows.append({
+                "date": d1, "prev_date": d0,
+                "risk_mode": "RISK_OFF", "market_ok": False, "trend_ok": False,
+                "breadth_metric": 0.0, "holdings": 0, "turnover": 0.0,
+                "gross_return": 0.0, "cost_frac": 0.0, "equity": equity[-1]
+            })
+            equity.append(equity[-1])
+            continue
+
+        trend_ok = bool(trend_map.get(d0, False))
+        breadth_metric = float(breadth_map.get(d0, 0.0))
+        market_ok = (trend_ok and (breadth_metric >= float(args.breadth_min)))
+        risk_mode = "RISK_ON" if market_ok else "RISK_OFF"
+
+        k = int(args.holdings_on) if market_ok else int(args.holdings_off)
+        k = max(0, k)
+
+        gross_ret = 0.0
+        turnover = 0.0
+        cost_paid = 0.0
+
+        if k > 0:
+            sel = day0.sort_values("total_score", ascending=False).head(k).copy()
+            day1 = df[df["date"] == d1][["code","change_percent"]].copy()
+            day1["change_percent"] = pd.to_numeric(day1["change_percent"], errors="coerce").fillna(0.0)
+            m = sel.merge(day1, on="code", how="left", suffixes=("", "_d1"))
+            m["change_percent_d1"] = m["change_percent_d1"].fillna(0.0)
+
+            gross_ret = float((m["change_percent_d1"] / 100.0).mean())
+
+            turnover = 0.5
+            cost_paid = turnover * cost_frac
+
+        prev_eq = equity[-1]
+        new_eq = prev_eq * (1.0 + gross_ret - cost_paid)
+        equity.append(float(new_eq))
+
+        rows.append({
+            "date": d1,
+            "prev_date": d0,
+            "risk_mode": risk_mode,
+            "market_ok": bool(market_ok),
+            "trend_ok": bool(trend_ok),
+            "breadth_metric": float(breadth_metric),
+            "holdings": int(k),
+            "turnover": float(turnover),
+            "gross_return": float(gross_ret),
+            "cost_frac": float(cost_paid),
+            "equity": float(new_eq),
+        })
+
+    out = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    out.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    summ = calc_summary(equity, args.init_capital, bars=len(out))
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(summ, f, ensure_ascii=False, indent=2)
+
+    print("=== PORTFOLIO v3 DONE ===")
+    print(f"breadth_field={args.breadth_field} breadth_min={args.breadth_min}")
+    print(f"bars={summ['bars']} final_equity={summ['final_equity']:.2f} total_return={summ['total_return']:.4f}")
+
+if __name__ == "__main__":
+    main()

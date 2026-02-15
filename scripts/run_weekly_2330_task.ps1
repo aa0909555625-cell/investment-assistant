@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-Location 'D:\projects\investment-assistant'
 
 if (-not (Test-Path 'D:\projects\investment-assistant\logs')) { New-Item -ItemType Directory -Force -Path 'D:\projects\investment-assistant\logs' | Out-Null }

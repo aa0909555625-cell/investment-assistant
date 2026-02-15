@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Stop"
 
 Write-Host "=== Investment Assistant :: Phase ⑦ Walk-Forward (80/20) :: Route A (OOS trades>0) ==="
 

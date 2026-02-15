@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>TW Dashboard 2026-02-12</title>
+<style>:root{
+  --bg:#0b1220; --card:#111a2d; --muted:#9fb0d0; --text:#e8efff; --line:#223055;
+  --pos:#5eead4; --neg:#fb7185; --accent:#60a5fa;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:1200px;margin:0 auto;padding:18px}
+.h1{font-size:20px;font-weight:700;margin:0 0 10px 0}
+.small{color:var(--muted);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.kpi{grid-column:span 3}
+.kpi .v{font-size:18px;font-weight:700}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{border-bottom:1px solid var(--line);padding:8px 6px;font-size:12px}
+.table th{color:var(--muted);text-align:left;font-weight:600}
+.pos{color:var(--pos)}
+.neg{color:var(--neg)}
+.muted{color:var(--muted)}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);font-size:12px}
+.section{grid-column:span 6}</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="h1">台股盤口總覽 <span class="badge">2026-02-12</span></div>
+  <div class="small">Capital：｜Top：｜Source：daily｜Index：n/a</div>
+
+  <div class="grid" style="margin-top:12px">
+    <div class="card kpi"><div class="small">加權指數 (TWSE)</div><div class="v">n/a</div></div>
+    <div class="card kpi"><div class="small">櫃買指數 (TPEX)</div><div class="v">n/a</div></div>
+    <div class="card kpi"><div class="small">資料狀態</div><div class="v">OK</div><div class="small muted">已可日更產出</div></div>
+    <div class="card kpi"><div class="small">提示</div><div class="v">先看指數再看類股</div><div class="small muted">用漲跌%判斷風險</div></div>
+
+    <div class="card section">
+      <div class="h1" style="font-size:14px;margin:0 0 8px 0">類股熱度（平均漲跌% Top 12）</div>
+      <table class="table">
+        <thead><tr><th>Sector</th><th>Count</th><th>Avg%</th></tr></thead>
+        <tbody><tr><td class='muted' colspan='3'>no sector data</td></tr>
+</tbody>
+      </table>
+    </div>
+
+    <div class="card section">
+      <div class="h1" style="font-size:14px;margin:0 0 8px 0">今日候選 Top（取前 20）</div>
+      <table class="table">
+        <thead><tr><th>Code</th><th>Name</th><th>Sector</th><th>Chg%</th><th>Score</th></tr></thead>
+        <tbody><tr><td class='muted' colspan='5'>no rows</td></tr>
+</tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</body>
+</html>

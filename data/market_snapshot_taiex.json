@@ -1,0 +1,18 @@
+{
+  "date": "2026-02-11",
+  "close": 33605.71,
+  "chg_pct": 1.6108018118723422,
+  "sma_fast": 30093.501600000003,
+  "sma_slow": 25701.45715,
+  "trend_ok": true,
+  "market_ok": true,
+  "risk_mode": "RISK_ON",
+  "source": "stooq",
+  "otc": {
+    "ok": false,
+    "error": "TPEx OTC fetch disabled (optional).",
+    "date": null,
+    "close": null,
+    "chg_pct": null
+  }
+}

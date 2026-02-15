@@ -1,0 +1,126 @@
+# -*- coding: utf-8 -*-
+"""
+Weekly pipeline (v0.9)
+- ranking (top N)
+- breadth (history + latest snapshot)
+- portfolio plan
+- portfolio backtest v3
+
+This file assumes the project already has:
+- scripts/ranking_engine.py
+- scripts/portfolio_engine.py (or equivalent) producing data/portfolio_plan_DATE.csv
+- scripts/backtest_portfolio_v3.py
+
+We avoid passing incompatible args to v3 and keep the pipeline stable.
+"""
+from __future__ import annotations
+import argparse
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+import pandas as pd
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+def py() -> str:
+    return sys.executable
+
+def run(cmd: list[str]):
+    p = subprocess.run(cmd, cwd=ROOT)
+    if p.returncode != 0:
+        raise SystemExit(p.returncode)
+
+def read_all_stocks(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, dtype={"code": str, "date": str, "source": str}, low_memory=False, encoding="utf-8-sig")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--capital", type=float, default=300000)
+    ap.add_argument("--top", type=int, default=200)
+    ap.add_argument("--threshold", type=float, default=70.0, help="score threshold used for breadth + portfolio plan selection")
+    ap.add_argument("--init_capital", type=float, default=1000000.0)
+    ap.add_argument("--breadth_min", type=float, default=0.01, help="gate for RISK_ON in portfolio v3")
+    args = ap.parse_args()
+
+    print(f"init_capital {args.init_capital} | Out-Host")
+
+    all_csv = os.path.join(ROOT, "data", "all_stocks_daily.csv")
+    if not os.path.exists(all_csv):
+        raise SystemExit("Missing data/all_stocks_daily.csv")
+
+    df = read_all_stocks(all_csv)
+    dates = sorted(df["date"].dropna().astype(str).unique().tolist())
+    if not dates:
+        raise SystemExit("No dates in all_stocks_daily.csv")
+    latest = dates[-1]
+
+    # -----------------------
+    # 1) Ranking (existing)
+    # -----------------------
+    # ranking_engine is project-specific; keep as-is call if exists
+    rank_py = os.path.join(ROOT, "scripts", "ranking_engine.py")
+    if os.path.exists(rank_py):
+        out_rank = os.path.join(ROOT, "data", f"ranking_{latest}.csv")
+        run([py(), rank_py, "--date", latest, "--top", str(args.top), "--out", out_rank])
+        print(f"OK: wrote -> data/ranking_{latest}.csv (rows={args.top})")
+    else:
+        print("[WARN] scripts/ranking_engine.py missing; skip ranking.")
+
+    # -----------------------
+    # 2) Breadth history + latest snapshot
+    # -----------------------
+    breadth_py = os.path.join(ROOT, "scripts", "breadth_analyzer.py")
+    out_hist = os.path.join(ROOT, "data", "breadth_history.csv")
+    out_csv = os.path.join(ROOT, "data", f"breadth_{latest}.csv")
+    out_json = os.path.join(ROOT, "data", f"breadth_{latest}.json")
+
+    run([
+        py(), breadth_py,
+        "--in_csv", r"data/all_stocks_daily.csv",
+        "--out_history", r"data/breadth_history.csv",
+        "--out_csv", fr"data/breadth_{latest}.csv",
+        "--out_json", fr"data/breadth_{latest}.json",
+        "--score_threshold", str(args.threshold),
+    ])
+
+    # -----------------------
+    # 3) Portfolio plan (existing engine if present)
+    # -----------------------
+    plan_py = os.path.join(ROOT, "scripts", "portfolio_engine.py")
+    if os.path.exists(plan_py):
+        run([
+            py(), plan_py,
+            "--date", latest,
+            "--capital", str(args.capital),
+            "--top", str(args.top),
+            "--threshold", str(args.threshold),
+            "--out", os.path.join("data", f"portfolio_plan_{latest}.csv"),
+        ])
+        print(f"OK: wrote -> data/portfolio_plan_{latest}.csv")
+    else:
+        # if your project already writes it elsewhere, we just warn
+        print("[WARN] scripts/portfolio_engine.py missing; assuming portfolio plan already exists.")
+
+    # -----------------------
+    # 4) Portfolio backtest v3
+    # -----------------------
+    v3 = os.path.join(ROOT, "scripts", "backtest_portfolio_v3.py")
+    run([
+        py(), v3,
+        "--in_csv", r"data/all_stocks_daily.csv",
+        "--market_csv", r"data/market_snapshot_taiex.csv",
+        "--breadth_csv", r"data/breadth_history.csv",
+        "--out_csv", r"reports/portfolio_backtest_v3.csv",
+        "--out_json", r"reports/portfolio_backtest_v3_summary.json",
+        "--init_capital", str(args.init_capital),
+        "--breadth_min", str(args.breadth_min),
+    ])
+
+    print("=== PORTFOLIO v3 DONE ===")
+    print(f"date={latest}")
+    print(f"summary: {os.path.join(ROOT,'reports','weekly_summary.md')}")
+
+if __name__ == "__main__":
+    main()

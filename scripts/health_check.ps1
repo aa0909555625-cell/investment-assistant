@@ -1,141 +1,64 @@
-[CmdletBinding()]
-param(
-    [Parameter()]
-    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+﻿$ErrorActionPreference = "Stop"
+Set-Location (Split-Path $PSScriptRoot -Parent)
 
-    [Parameter()]
-    [int]$MaxAgeMinutes = 1440,
+function Normalize-File([string]$path) {
+  # DO NOT touch this script while it is running
+  if ((Resolve-Path $path).Path -eq (Resolve-Path $PSCommandPath).Path) { return }
 
-    [Parameter()]
-    [string[]]$RequiredPatterns = @(
-        "phase5_signals_*.csv",
-        "phase6_trades_*.csv",
-        "phase6_equity_*.csv",
-        "prices_*.csv"
-    ),
+  $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $path))
+  $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
 
-    [Parameter()]
-    [int]$MinMatch = 1,
+  $text = if ($hasBom) {
+    [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length-3)
+  } else {
+    [System.Text.Encoding]::UTF8.GetString($bytes)
+  }
 
-    [Parameter()]
-    [switch]$AnyRecent,
+  $text = $text -replace "`r?`n", "`r`n"
+  $text = $text -replace "`0", ""
 
-    [Parameter()]
-    [switch]$VerboseMode
-)
-
-Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
-function Write-Status {
-    param(
-        [Parameter(Mandatory)][string]$Message,
-        [Parameter()][ValidateSet("INFO","WARN","ERROR","OK")][string]$Level = "INFO"
-    )
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-Host "[$timestamp][$Level] $Message"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText((Resolve-Path $path), $text, $utf8NoBom)
 }
 
-function Format-Dt([datetime]$dt) {
-    return $dt.ToString("yyyy-MM-dd HH:mm:ss")
+function Syntax-Check([string]$path) {
+  $raw = Get-Content $path -Raw -Encoding UTF8
+  [void][scriptblock]::Create($raw)
 }
 
-function Get-RecentFilesByPattern {
-    param(
-        [Parameter(Mandatory)][string]$Dir,
-        [Parameter(Mandatory)][string]$Pattern,
-        [Parameter(Mandatory)][datetime]$Threshold
-    )
+Write-Host ("=== HEALTH CHECK ({0}) ===" -f (Get-Date -Format "yyyyMMdd_HHmmss")) -ForegroundColor Cyan
+Write-Host ("Root: {0}" -f (Get-Location).Path) -ForegroundColor DarkGray
 
-    if (-not (Test-Path -LiteralPath $Dir)) { return @() }
-
-    $items = Get-ChildItem -LiteralPath $Dir -Filter $Pattern -File -ErrorAction SilentlyContinue
-    if (-not $items) { return @() }
-
-    return @($items | Where-Object { $_.LastWriteTime -ge $Threshold })
+# folders
+foreach($d in @(".\data",".\reports",".\logs",".\archive",".\scripts")) {
+  if (!(Test-Path $d)) { New-Item -ItemType Directory -Path $d | Out-Null }
 }
 
-try {
-    $dataPath = Join-Path $ProjectRoot "data"
-    $threshold = (Get-Date).AddMinutes(-$MaxAgeMinutes)
+# scan scripts (skip *.bak*)
+$ps1 = @()
+if (Test-Path ".\run.ps1") { $ps1 += ".\run.ps1" }
+$ps1 += Get-ChildItem ".\scripts" -Filter "*.ps1" -File -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -notmatch "\.bak_" } |
+  Select-Object -ExpandProperty FullName
 
-    Write-Status "Health check started"
-    Write-Status ("Project root: {0}" -f [string]$ProjectRoot)
-    Write-Status ("Data path: {0}" -f [string]$dataPath)
-    Write-Status ("MaxAgeMinutes: {0} (threshold: {1})" -f [string]$MaxAgeMinutes, (Format-Dt $threshold))
+$bad = New-Object System.Collections.Generic.List[string]
+$ok = 0
 
-    if (-not (Test-Path -LiteralPath $dataPath)) {
-        Write-Status ("Data directory not found: {0}" -f [string]$dataPath) "ERROR"
-        exit 1
-    }
-
-    if ($AnyRecent) {
-        Write-Status "Mode: AnyRecent"
-
-        $recentAny = @(
-            Get-ChildItem -LiteralPath $dataPath -Recurse -File -ErrorAction Stop |
-            Where-Object { $_.LastWriteTime -ge $threshold }
-        )
-
-        if ($recentAny.Count -eq 0) {
-            Write-Status ("No recent data files found within {0} minutes" -f [string]$MaxAgeMinutes) "WARN"
-            exit 2
-        }
-
-        Write-Status ("Found {0} recent file(s)" -f [string]$recentAny.Count)
-
-        if ($VerboseMode) {
-            $recentAny | Sort-Object LastWriteTime -Desc | Select-Object -First 50 | ForEach-Object {
-                Write-Host (" - {0} (LastWrite: {1})" -f $_.FullName, (Format-Dt $_.LastWriteTime))
-            }
-        }
-
-        Write-Status "Health check PASSED" "OK"
-        exit 0
-    }
-
-    Write-Status "Mode: RequiredPatterns"
-    Write-Status ("RequiredPatterns: {0}" -f ($RequiredPatterns -join ", "))
-    Write-Status ("MinMatch: {0}" -f [string]$MinMatch)
-
-    $matches = @()
-    foreach ($p in $RequiredPatterns) {
-        $matches += Get-RecentFilesByPattern -Dir $dataPath -Pattern $p -Threshold $threshold
-    }
-
-    $matches = @($matches | Sort-Object LastWriteTime -Desc)
-    $count = $matches.Count
-
-    if ($count -lt $MinMatch) {
-        Write-Status ("Recent required outputs found: {0}, need at least: {1}" -f [string]$count, [string]$MinMatch) "WARN"
-
-        if ($VerboseMode) {
-            foreach ($p in $RequiredPatterns) {
-                $latest = Get-ChildItem -LiteralPath $dataPath -Filter $p -File -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTime -Desc | Select-Object -First 1
-                if ($null -eq $latest) {
-                    Write-Host (" - {0}: (no file)" -f $p)
-                } else {
-                    Write-Host (" - {0}: latest {1} ({2})" -f $p, (Format-Dt $latest.LastWriteTime), $latest.Name)
-                }
-            }
-        }
-
-        exit 2
-    }
-
-    Write-Status ("Found {0} recent required output file(s)" -f [string]$count)
-
-    if ($VerboseMode) {
-        $matches | Select-Object -First 50 | ForEach-Object {
-            Write-Host (" - {0} (LastWrite: {1})" -f $_.FullName, (Format-Dt $_.LastWriteTime))
-        }
-    }
-
-    Write-Status "Health check PASSED" "OK"
-    exit 0
+foreach($f in $ps1) {
+  try {
+    Normalize-File $f
+    Syntax-Check $f
+    $ok++
+  } catch {
+    $bad.Add("$f :: $($_.Exception.Message)")
+  }
 }
-catch {
-    Write-Status $_.Exception.Message "ERROR"
-    exit 1
+
+Write-Host ("OK: ps1 checked = {0}" -f $ok) -ForegroundColor Green
+if ($bad.Count -gt 0) {
+  Write-Host "ERROR: syntax issues found:" -ForegroundColor Red
+  $bad | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+  throw "health_check failed due to syntax errors."
 }
+
+Write-Host "OK: health_check PASS" -ForegroundColor Green

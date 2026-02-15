@@ -1,19 +1,16 @@
+﻿# outputs
+/reports/
+/logs/
+/archive/
 
-# --- generated reports / archives (do not commit) ---
-reports/weekly/archive/
-reports/**/archive/
-*.jsonl
-*.log
-# --- python / venv ---
+# local data snapshots (keep if you want)
+/data/*.tmp
+/data/*.bak
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
 .venv/
-__pycache__/
-*.pyc
-# --- generated data / logs / reports ---
-data/
-logs/
-# --- generated weekly report archives (big) ---
-# --- python venv ---
-# --- runtime data / logs (do not commit) ---
-# --- generated reports archives (do not commit) ---
-# --- generated reports (do not commit) ---
-reports/
+

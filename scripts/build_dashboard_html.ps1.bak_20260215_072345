@@ -1,0 +1,240 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [string]$OutDir = ".\reports",
+  [switch]$Open,
+  [int]$DiversifyN = 6
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function SafeTrim([object]$v){ if($null -eq $v){ "" } else { ([string]$v).Trim() } }
+
+function Get-Prop {
+  param(
+    [Parameter(Mandatory=$true)] $Obj,
+    [Parameter(Mandatory=$true)] [string] $Name,
+    $Default = $null
+  )
+  try{
+    if($null -eq $Obj){ return $Default }
+    if($Obj -is [System.Collections.IDictionary]){
+      if($Obj.Contains($Name)){ return $Obj[$Name] }
+      return $Default
+    }
+    $p = $Obj.PSObject.Properties[$Name]
+    if($null -ne $p){ return $p.Value }
+    return $Default
+  } catch { return $Default }
+}
+
+function To-Num([object]$v, [double]$def = 0){
+  $s = SafeTrim $v
+  if($s -eq ""){ return $def }
+  $s = $s.Replace("%","")
+  $x = $def
+  if([double]::TryParse($s, [ref]$x)){ return $x }
+  return $def
+}
+
+function Round2([double]$x){ [Math]::Round($x, 2, [MidpointRounding]::AwayFromZero) }
+function Round1([double]$x){ [Math]::Round($x, 1, [MidpointRounding]::AwayFromZero) }
+
+# IMPORTANT: avoid alias collisions (h/Get-History)
+function Html([string]$s){
+  return [System.Net.WebUtility]::HtmlEncode($s)
+}
+
+if([string]::IsNullOrWhiteSpace($Date)){ $Date = (Get-Date -Format "yyyy-MM-dd") }
+
+$OutDirFull = (Resolve-Path $OutDir).Path
+$indicesPath = Join-Path $OutDirFull ("indices_{0}.json" -f $Date)
+$snapPath    = Join-Path $OutDirFull ("market_snapshot_{0}.json" -f $Date)
+
+if(!(Test-Path $indicesPath)){ throw "Missing indices json: $indicesPath" }
+if(!(Test-Path $snapPath)){ throw "Missing snapshot json: $snapPath" }
+
+$indices = Get-Content $indicesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$snap    = Get-Content $snapPath    -Raw -Encoding UTF8 | ConvertFrom-Json
+
+$taiex = Get-Prop $indices "taiex" @{}
+$tpex  = Get-Prop $indices "tpex"  @{}
+
+$taiexLast = To-Num (Get-Prop $taiex "last" 0) 0
+$taiexPct  = To-Num (Get-Prop $taiex "change_percent" 0) 0
+$tpexLast  = To-Num (Get-Prop $tpex  "last" 0) 0
+$tpexPct   = To-Num (Get-Prop $tpex  "change_percent" 0) 0
+
+$marketState = Get-Prop $snap "market_state" @{}
+$mode = SafeTrim (Get-Prop $marketState "mode" "neutral")
+$risk = To-Num (Get-Prop $marketState "risk" 0) 0
+$notes = Get-Prop $marketState "notes" @()
+
+# notes might be scalar; normalize to array
+$notesArr = @()
+if($null -ne $notes){
+  if($notes -is [System.Array]){
+    $notesArr = $notes
+  } else {
+    $notesArr = @($notes)
+  }
+}
+
+$tape = Get-Prop $snap "tape_summary" @{}
+$band = SafeTrim (Get-Prop $tape "band" "觀望")
+$strategy = SafeTrim (Get-Prop $tape "strategy" "資料不足")
+$suggestPos = To-Num (Get-Prop $tape "suggested_position" 0.3) 0.3
+
+$hotZones = Get-Prop $tape "hot_zones" @()
+$weakZones = Get-Prop $tape "weak_zones" @()
+
+function Render-Badges($arr){
+  $out = ""
+  if($null -eq $arr){ return $out }
+  $list = @()
+  if($arr -is [System.Array]){ $list = $arr } else { $list = @($arr) }
+  foreach($z in $list){
+    $s = SafeTrim $z
+    if($s -eq ""){ continue }
+    $out += ("<span class='badge'>" + (Html $s) + "</span> ")
+  }
+  return $out
+}
+
+$sectorHeat = Get-Prop $snap "sector_heat" @{}
+$topS = Get-Prop $sectorHeat "top" @()
+$botS = Get-Prop $sectorHeat "bottom" @()
+
+function Render-SectorRows($rows){
+  $html = ""
+  if($null -eq $rows){ return $html }
+  $list = @()
+  if($rows -is [System.Array]){ $list = $rows } else { $list = @($rows) }
+
+  foreach($r in $list){
+    $sector = SafeTrim (Get-Prop $r "sector" "")
+    $count  = To-Num (Get-Prop $r "count" 0) 0
+    $heat   = To-Num (Get-Prop $r "heat_score" 0) 0
+    $avgS   = To-Num (Get-Prop $r "avg_total_score" 0) 0
+    $avgP   = To-Num (Get-Prop $r "avg_change_percent" 0) 0
+    $up     = To-Num (Get-Prop $r "up" 0) 0
+    $down   = To-Num (Get-Prop $r "down" 0) 0
+    $flat   = To-Num (Get-Prop $r "flat" 0) 0
+
+    $html += "<tr>"
+    $html += ("<td>" + (Html $sector) + "</td>")
+    $html += ("<td class='num'>" + ([string][int]$count) + "</td>")
+    $html += ("<td class='num'>" + ([string](Round2 $heat)) + "</td>")
+    $html += ("<td class='num'>" + ([string](Round2 $avgS)) + "</td>")
+    $html += ("<td class='num'>" + ([string](Round2 $avgP)) + "%</td>")
+    $html += ("<td class='num'>" + ([string][int]$up) + "/" + ([string][int]$down) + "/" + ([string][int]$flat) + "</td>")
+    $html += "</tr>`n"
+  }
+  return $html
+}
+
+# Build notes list
+$notesLi = ""
+if($notesArr.Count -gt 0){
+  foreach($n in $notesArr){
+    $notesLi += ("<li class='small'>" + (Html (SafeTrim $n)) + "</li>")
+  }
+}
+$notesUl = ""
+if($notesLi -ne ""){
+  $notesUl = "<ul style='margin:6px 0 0 18px'>$notesLi</ul>"
+}
+
+$topRows = Render-SectorRows $topS
+$botRows = Render-SectorRows $botS
+
+$hotBadges = Render-Badges $hotZones
+$weakBadges = Render-Badges $weakZones
+
+$title = "Investment Assistant Dashboard $Date"
+$outPath = Join-Path $OutDirFull ("dashboard_{0}.html" -f $Date)
+
+$html = @"
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title</title>
+<style>
+:root{font-family:Segoe UI,Arial,sans-serif;}
+body{margin:18px;background:#0b1220;color:#e6eefc;}
+h1{margin:0 0 10px 0;font-size:20px}
+.card{background:#111a2d;border:1px solid #22304f;border-radius:12px;padding:14px;margin:10px 0}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.kpi{display:flex;justify-content:space-between;align-items:flex-end}
+.kpi .v{font-size:22px;font-weight:700}
+.kpi .s{opacity:.8}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #33466f;font-size:12px;opacity:.9;margin-right:6px}
+.muted{opacity:.75}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th,td{border-bottom:1px solid #22304f;padding:8px 6px;font-size:13px}
+th{text-align:left;opacity:.9}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.small{font-size:12px}
+</style>
+</head>
+<body>
+  <h1>Investment Assistant Dashboard <span class="badge">$Date</span></h1>
+
+  <div class="grid">
+    <div class="card">
+      <div class="kpi"><div>TAIEX</div><div class="v">$(Round2 $taiexLast)</div></div>
+      <div class="s muted">漲跌：$(Round2 $taiexPct)%</div>
+    </div>
+    <div class="card">
+      <div class="kpi"><div>TPEX</div><div class="v">$(Round2 $tpexLast)</div></div>
+      <div class="s muted">漲跌：$(Round2 $tpexPct)%</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="kpi">
+      <div>市場狀態 <span class="badge">$(Html $mode)</span> <span class="badge">$(Html $band)</span></div>
+      <div class="v">風險 $(Round1 $risk)</div>
+    </div>
+    <div class="muted small">建議部位：$(Round2 $suggestPos)　策略：$(Html $strategy)</div>
+    $notesUl
+  </div>
+
+  <div class="card">
+    <div class="kpi"><div>盤口摘要</div><div class="v">熱 / 弱</div></div>
+    <div style="margin-top:8px"><span class="muted small">Hot zones：</span> $hotBadges</div>
+    <div style="margin-top:8px"><span class="muted small">Weak zones：</span> $weakBadges</div>
+  </div>
+
+  <div class="card">
+    <div class="kpi"><div>類股熱度 Top</div><div class="muted small">up/down/flat</div></div>
+    <table>
+      <thead><tr><th>Sector</th><th class="num">Count</th><th class="num">Heat</th><th class="num">AvgScore</th><th class="num">Avg%</th><th class="num">U/D/F</th></tr></thead>
+      <tbody>
+      $topRows
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="kpi"><div>類股熱度 Bottom</div><div class="muted small">up/down/flat</div></div>
+    <table>
+      <thead><tr><th>Sector</th><th class="num">Count</th><th class="num">Heat</th><th class="num">AvgScore</th><th class="num">Avg%</th><th class="num">U/D/F</th></tr></thead>
+      <tbody>
+      $botRows
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
+"@
+
+[System.IO.File]::WriteAllText($outPath, $html.Replace("`r`n","`n").Replace("`n","`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+Write-Host ("OK: wrote HTML -> {0}" -f $outPath) -ForegroundColor Green
+if($Open){ Start-Process $outPath | Out-Null }

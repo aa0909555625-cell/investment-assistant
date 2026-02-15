@@ -1,0 +1,63 @@
+<?php
+
+use Illuminate\Foundation\Inspiring;
+use Illuminate\Support\Facades\Artisan;
+
+Artisan::command('inspire', function () {
+    $this->comment(Inspiring::quote());
+})->purpose('Display an inspiring quote');
+
+/*
+|--------------------------------------------------------------------------
+| Investment Assistant - Market Commands
+|--------------------------------------------------------------------------
+*/
+Artisan::command('market:fetch-daily-bars {date?}', function ($date = null) {
+    $args = [];
+    if (!empty($date)) { $args['date'] = $date; }
+    $this->call(\App\Console\Commands\Market\FetchDailyBars::class, $args);
+})->purpose('Fetch Taiwan stock daily bars into DB');
+Artisan::command('market:generate-daily-report {date}', function ($date) {
+    $this->call(\App\Console\Commands\Market\GenerateDailyReport::class, ['date' => $date]);
+})->purpose('Generate v1 daily scores + mixed Top20 + report snapshot');
+Artisan::command('market:comment {date}', function ($date) {
+    $this->call(\App\Console\Commands\Market\GenerateAiComment::class, ['date' => $date]);
+})->purpose('Generate rule-based Top20 comments into daily_reports.ai_comment');
+Artisan::command('market:run-daily {date?}', function ($date = null) {
+    $args = $date ? ['date' => $date] : [];
+    $this->call(\App\Console\Commands\Market\RunDaily::class, $args);
+})->purpose('Run full daily pipeline: fetch -> score -> report -> comment');
+'
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText((Resolve-Path $consolePath).Path, $raw + $append, $utf8NoBom)
+}
+
+php artisan optimize:clear
+composer dump-autoload
+Set-Location "D:\projects\investment-assistant\server"
+
+# UTF8 No BOM writer
+function Write-Utf8NoBom {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string]$Content
+  )
+  $dir = Split-Path $Path
+  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  $full = Join-Path (Resolve-Path $dir).Path (Split-Path $Path -Leaf)
+  [System.IO.File]::WriteAllText($full, $Content, $utf8NoBom)
+}
+
+$consolePath = "routes\console.php"
+if (-not (Test-Path $consolePath)) { throw "Missing: $consolePath" }
+
+$raw = Get-Content $consolePath -Encoding UTF8 -Raw
+
+if ($raw -notmatch "market:run-daily") {
+  $append = @'
+
+Artisan::command('market:run-daily {date?}', function ($date = null) {
+    $args = $date ? ['date' => $date] : [];
+    $this->call(\App\Console\Commands\Market\RunDaily::class, $args);
+})->purpose('Run full daily pipeline: fetch -> score/report -> comment');

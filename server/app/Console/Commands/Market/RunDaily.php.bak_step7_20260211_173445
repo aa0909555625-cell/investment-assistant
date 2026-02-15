@@ -1,0 +1,39 @@
+<?php
+
+namespace App\Console\Commands\Market;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
+
+class RunDaily extends Command
+{
+    protected $signature = 'market:run-daily {date?}';
+    protected $description = 'Run full daily pipeline: fetch -> score/report -> comment (auto aligns to actual latest trading date)';
+
+    public function handle(): int
+    {
+        $requested = (string)($this->argument('date') ?: Carbon::now('Asia/Taipei')->toDateString());
+
+        $this->info("Running daily pipeline for requested_date={$requested}");
+
+        // 1) Always fetch snapshot first (may be latest trading day, not requested)
+        $this->call('market:fetch-daily-bars', ['date' => $requested]);
+
+        // 2) Determine the actual latest date in daily_bars after fetch
+        $actual = DB::table('daily_bars')->max('date');
+        if (!$actual) {
+            $this->error("No daily_bars found after fetch. Abort.");
+            return self::FAILURE;
+        }
+
+        $this->info("Auto-aligned actual_trading_date={$actual} (requested={$requested})");
+
+        // 3) Generate report + comment using the actual date
+        $this->call('market:generate-daily-report', ['date' => $actual]);
+        $this->call('market:comment', ['date' => $actual]);
+
+        $this->info("Daily pipeline DONE for actual_trading_date={$actual}");
+        return self::SUCCESS;
+    }
+}

@@ -1,0 +1,241 @@
+# -*- coding: utf-8 -*-
+"""
+Portfolio Backtest v3 (Cross-sectional, dynamic holdings, risk switch, costs)
+
+Inputs:
+- data/all_stocks_daily.csv  (must include: date, code, total_score, change_percent)
+- data/market_snapshot_taiex.csv (optional but recommended; contains date, market_ok, trend_ok, risk_mode)
+
+Outputs:
+- reports/portfolio_backtest_v3.csv
+- reports/portfolio_backtest_v3_summary.json
+
+Key behavior:
+- Only take positions when market_ok is True.
+- Select top N by total_score (NO hard threshold to avoid "all zero holdings" on placeholder scores).
+- Equal-weight portfolio; daily return approximated by next-day change_percent for held symbols.
+- Trading cost = turnover * cost_bps/10000.
+
+This is an ENGINE baseline, not a final trading model.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, List, Set, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def read_csv(path: str) -> pd.DataFrame:
+    return pd.read_csv(path, dtype={"code": str, "source": str}, low_memory=False, encoding="utf-8-sig")
+
+
+def safe_bool(x) -> bool:
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    return s in ("1", "true", "t", "yes", "y")
+
+
+def write_csv(path: str, df: pd.DataFrame) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def write_json(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def compute_max_drawdown(equity: np.ndarray) -> float:
+    if equity.size == 0:
+        return 0.0
+    peak = np.maximum.accumulate(equity)
+    dd = (equity - peak) / peak
+    return float(dd.min())
+
+
+def compute_sharpe(daily_ret: np.ndarray) -> float:
+    if daily_ret.size < 2:
+        return 0.0
+    mu = daily_ret.mean()
+    sd = daily_ret.std(ddof=1)
+    if sd == 0:
+        return 0.0
+    return float((mu / sd) * np.sqrt(252.0))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_csv", default=r"data/all_stocks_daily.csv")
+    ap.add_argument("--market_csv", default=r"data/market_snapshot_taiex.csv")
+    ap.add_argument("--out_csv", default=r"reports/portfolio_backtest_v3.csv")
+    ap.add_argument("--out_json", default=r"reports/portfolio_backtest_v3_summary.json")
+    ap.add_argument("--start", default="")
+    ap.add_argument("--end", default="")
+    ap.add_argument("--init_capital", type=float, default=1_000_000.0)
+    ap.add_argument("--holdings_on", type=int, default=15)
+    ap.add_argument("--holdings_off", type=int, default=0)
+    ap.add_argument("--cost_bps", type=float, default=25.0)  # 25 bps = 0.25% per full turnover
+    args = ap.parse_args()
+
+    df = read_csv(os.path.join(ROOT, args.in_csv))
+    need = {"date","code","total_score","change_percent"}
+    if not need.issubset(set(df.columns)):
+        raise ValueError(f"{args.in_csv} must contain: {sorted(list(need))}")
+
+    df["date"] = df["date"].astype(str)
+    df["code"] = df["code"].astype(str)
+    df["total_score"] = pd.to_numeric(df["total_score"], errors="coerce").fillna(0.0)
+    df["change_percent"] = pd.to_numeric(df["change_percent"], errors="coerce").fillna(0.0)
+
+    dates = sorted(df["date"].unique().tolist())
+    if args.start:
+        dates = [d for d in dates if d >= args.start]
+    if args.end:
+        dates = [d for d in dates if d <= args.end]
+
+    if len(dates) < 2:
+        # placeholder output
+        out = pd.DataFrame([{
+            "date": dates[0] if dates else "",
+            "prev_date": "",
+            "risk_mode": "RISK_OFF",
+            "market_ok": False,
+            "trend_ok": False,
+            "breadth_ratio": 0.0,
+            "holdings": 0,
+            "turnover": 0.0,
+            "gross_return": 0.0,
+            "cost_frac": 0.0,
+            "net_return": 0.0,
+            "equity": args.init_capital,
+        }])
+        write_csv(os.path.join(ROOT, args.out_csv), out)
+        write_json(os.path.join(ROOT, args.out_json), {
+            "init_capital": args.init_capital,
+            "final_equity": args.init_capital,
+            "total_return": 0.0,
+            "annualized_return": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "bars": max(0, len(dates)-1),
+            "note": f"Need >=2 trading dates. Found {len(dates)} date(s)."
+        })
+        return
+
+    # market snapshot (optional)
+    mkt = None
+    mkt_map: Dict[str, dict] = {}
+    mkt_path = os.path.join(ROOT, args.market_csv)
+    if os.path.exists(mkt_path):
+        mkt = read_csv(mkt_path)
+        mkt["date"] = mkt["date"].astype(str)
+        for _, r in mkt.iterrows():
+            mkt_map[str(r["date"])] = {
+                "risk_mode": str(r.get("risk_mode","RISK_OFF")),
+                "market_ok": safe_bool(r.get("market_ok", False)),
+                "trend_ok": safe_bool(r.get("trend_ok", False)),
+            }
+
+    equity = args.init_capital
+    held: Set[str] = set()
+    rows: List[dict] = []
+    daily_net: List[float] = []
+
+    cost_rate = float(args.cost_bps) / 10000.0
+
+    for i in range(len(dates) - 1):
+        d0 = dates[i]
+        d1 = dates[i + 1]
+
+        snap = mkt_map.get(d0, None)
+        risk_mode = snap["risk_mode"] if snap else "RISK_OFF"
+        market_ok = snap["market_ok"] if snap else False
+        trend_ok = snap["trend_ok"] if snap else False
+
+        # holdings target by mode
+        target_n = args.holdings_on if market_ok else args.holdings_off
+        target_n = int(max(0, target_n))
+
+        day0 = df[df["date"] == d0].copy()
+        day1 = df[df["date"] == d1].copy()
+
+        # choose next holdings
+        if target_n > 0:
+            day0 = day0.sort_values("total_score", ascending=False)
+            selected = day0.head(target_n)["code"].astype(str).tolist()
+            new_held = set(selected)
+        else:
+            new_held = set()
+
+        # turnover = fraction of portfolio traded (approx by set difference)
+        if len(held) == 0 and len(new_held) == 0:
+            turnover = 0.0
+        else:
+            # buys + sells divided by (2*max(held,new_held)) to keep 0..1-ish
+            diff = len(held.symmetric_difference(new_held))
+            denom = max(1, max(len(held), len(new_held)) * 2)
+            turnover = diff / denom
+
+        # next-day return: equal weight mean of day1 change_percent for held symbols
+        if len(new_held) > 0:
+            day1_map = dict(zip(day1["code"].astype(str), day1["change_percent"].astype(float)))
+            rets = [day1_map.get(c, 0.0) / 100.0 for c in new_held]
+            gross = float(np.mean(rets)) if rets else 0.0
+        else:
+            gross = 0.0
+
+        cost_frac = float(turnover) * cost_rate
+        net = gross - cost_frac
+        equity = equity * (1.0 + net)
+
+        rows.append({
+            "date": d1,
+            "prev_date": d0,
+            "risk_mode": risk_mode,
+            "market_ok": bool(market_ok),
+            "trend_ok": bool(trend_ok),
+            "breadth_ratio": 0.0,  # reserved; you can later inject breadth analyzer output
+            "holdings": int(len(new_held)),
+            "turnover": float(turnover),
+            "gross_return": float(gross),
+            "cost_frac": float(cost_frac),
+            "net_return": float(net),
+            "equity": float(equity),
+        })
+        daily_net.append(net)
+        held = new_held
+
+    out = pd.DataFrame(rows)
+    write_csv(os.path.join(ROOT, args.out_csv), out)
+
+    eq = out["equity"].astype(float).to_numpy()
+    dr = np.array(daily_net, dtype=float)
+
+    total_return = (eq[-1] / args.init_capital) - 1.0 if eq.size else 0.0
+    ann = (1.0 + total_return) ** (252.0 / max(1, len(dr))) - 1.0 if dr.size else 0.0
+
+    summary = {
+        "init_capital": float(args.init_capital),
+        "final_equity": float(eq[-1]) if eq.size else float(args.init_capital),
+        "total_return": float(total_return),
+        "annualized_return": float(ann),
+        "max_drawdown": float(compute_max_drawdown(eq)),
+        "sharpe": float(compute_sharpe(dr)),
+        "bars": int(len(dr)),
+    }
+    write_json(os.path.join(ROOT, args.out_json), summary)
+
+    print("=== PORTFOLIO v3 DONE ===")
+    print(f"bars={summary['bars']} final_equity={summary['final_equity']:.2f} total_return={summary['total_return']:.4f}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,610 @@
+'@param(
+  [string]$Date = "",
+  [double]$Capital = 300000,
+  [int]$Top = 4000,
+
+  [string]$DecisionsPath    = ".\data\all_stocks_decisions.csv",
+  [string]$FallbackPath     = ".\data\all_stocks_daily.csv",
+  [string]$IndexPath        = ".\data\index_daily.csv",
+
+  # Step 7-3: new preferred index file (close + change_percent)
+  [string]$MarketIndexPath  = ".\data\market_index_daily.csv",
+
+  [string]$OutDir           = ".\reports",
+  [switch]$ListDates,
+  [switch]$Open
+)
+
+# =========================
+# Helpers
+# =========================
+function SafeTrim($v){
+  if($null -eq $v){ return "" }
+  return "$v".Trim()
+}
+
+function To-Scalar($v) {
+  if ($null -eq $v) { return $null }
+  if ($v -is [System.Array]) { if ($v.Length -gt 0) { return $v[0] } else { return $null } }
+  return $v
+}
+
+function To-Num($v, $default=$null) {
+  $v = To-Scalar $v
+  if ($null -eq $v) { return $default }
+  $s = "$v".Trim()
+  if ($s -eq "") { return $default }
+
+  $n = 0.0
+  $styles = [System.Globalization.NumberStyles]::Float
+  $ci = [System.Globalization.CultureInfo]::InvariantCulture
+
+  if ([double]::TryParse($s, $styles, $ci, [ref]$n)) { return [double]$n }
+  if ([double]::TryParse($s, [ref]$n)) { return [double]$n }
+
+  $s2 = $s.Replace(",", ".")
+  if ([double]::TryParse($s2, $styles, $ci, [ref]$n)) { return [double]$n }
+  return $default
+}
+
+function HtmlEscape([string]$s) {
+  if ($null -eq $s) { return "" }
+  return ($s -replace "&","&amp;" -replace "<","&lt;" -replace ">","&gt;" -replace '"',"&quot;")
+}
+
+function TryLoadCsv([string]$path){
+  if(Test-Path $path){
+    $t = Import-Csv $path
+    if($t -and $t.Count -gt 0){ return $t }
+  }
+  return @()
+}
+
+function Parse-Date([string]$s){
+  $s = SafeTrim $s
+  if($s -eq ""){ return $null }
+
+  $ci = [System.Globalization.CultureInfo]::InvariantCulture
+  $styles = [System.Globalization.DateTimeStyles]::None
+
+  $dt = [datetime]::MinValue
+  if([System.DateTime]::TryParseExact($s, "yyyy-MM-dd", $ci, $styles, [ref]$dt)){
+    return $dt
+  }
+
+  $dt2 = [datetime]::MinValue
+  if([System.DateTime]::TryParse($s, $ci, $styles, [ref]$dt2)){
+    return $dt2
+  }
+
+  $dt3 = [datetime]::MinValue
+  if([System.DateTime]::TryParse($s, [ref]$dt3)){
+    return $dt3
+  }
+
+  return $null
+}
+
+function Get-UniqueDates([object[]]$rows){
+  if(!$rows -or $rows.Count -eq 0){ return @() }
+  if(-not ($rows[0].PSObject.Properties.Name -contains "date")){ return @() }
+
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach($r in $rows){
+    $raw = SafeTrim $r.date
+    if($raw -eq ""){ continue }
+    $dt = Parse-Date $raw
+    if($null -eq $dt){ continue }
+    $out.Add($dt.ToString("yyyy-MM-dd")) | Out-Null
+  }
+
+  return ($out | Sort-Object -Unique)
+}
+
+function Get-LatestDateFromRows($rows){
+  $ds = Get-UniqueDates $rows
+  if(!$ds -or $ds.Count -eq 0){ return "" }
+
+  $dts = @()
+  foreach($s in $ds){
+    $d = Parse-Date $s
+    if($null -ne $d){ $dts += $d }
+  }
+  if(!$dts -or $dts.Count -eq 0){ return "" }
+
+  return (($dts | Sort-Object | Select-Object -Last 1).ToString("yyyy-MM-dd"))
+}
+
+function Compute-IndexPctChange($idxRows, [string]$indexCode, [string]$targetDate){
+  # idxRows schema: index_code,date,close
+  $t = Parse-Date $targetDate
+  if($null -eq $t){
+    return @{ pct=$null; note=("bad Date=" + $targetDate) }
+  }
+
+  $items = @()
+  foreach($r in $idxRows){
+    if((SafeTrim $r.index_code) -ne $indexCode){ continue }
+    $d = Parse-Date (SafeTrim $r.date)
+    if($null -eq $d){ continue }
+    $close = To-Num $r.close $null
+    if($null -eq $close){ continue }
+    $items += [pscustomobject]@{ dt=$d; close=[double]$close }
+  }
+
+  if(!$items -or $items.Count -eq 0){
+    return @{ pct=$null; note=("no rows for index_code=" + $indexCode) }
+  }
+
+  $items = $items | Sort-Object dt
+
+  $today = ($items | Where-Object { $_.dt -le $t } | Select-Object -Last 1)
+  if($null -eq $today){
+    return @{ pct=$null; note=("no data <= " + $targetDate + " for " + $indexCode) }
+  }
+
+  $prev = ($items | Where-Object { $_.dt -lt $today.dt } | Select-Object -Last 1)
+  if($null -eq $prev){
+    return @{ pct=$null; note=("no prev day for " + $indexCode) }
+  }
+
+  if($prev.close -eq 0){
+    return @{ pct=$null; note="prev close=0" }
+  }
+
+  $pct = (($today.close / $prev.close) - 1.0) * 100.0
+  return @{ pct=$pct; note="" }
+}
+
+function Format-Pct([double]$v){
+  if($v -ge 0){ return ("+{0:N2}%" -f $v) }
+  return ("{0:N2}%" -f $v)
+}
+
+function Show-DateSummary([string]$label, [object[]]$rows){
+  Write-Host ($label) -ForegroundColor DarkCyan
+  if(!$rows -or $rows.Count -eq 0){ Write-Host "  (no rows)" -ForegroundColor Yellow; return }
+  if(-not ($rows[0].PSObject.Properties.Name -contains "date")){ Write-Host "  (no date column)" -ForegroundColor Yellow; return }
+
+  $ds = Get-UniqueDates $rows
+  if(!$ds -or $ds.Count -eq 0){ Write-Host "  (no valid dates)" -ForegroundColor Yellow; return }
+
+  foreach($d in $ds){
+    $cnt = ($rows | Where-Object { (SafeTrim $_.date) -eq $d } | Measure-Object).Count
+    Write-Host ("  - {0}  (rows={1})" -f $d, $cnt)
+  }
+}
+
+function Get-MarketIndexSnapshot([string]$date){
+  # Prefer MarketIndexPath: date,index,close,change_percent  (index = TWSE / TPEx)
+  $mi = TryLoadCsv $MarketIndexPath
+  if($mi.Count -gt 0 -and ($mi[0].PSObject.Properties.Name -contains "index")){
+    $tw = ($mi | Where-Object { (SafeTrim $_.date) -eq $date -and (SafeTrim $_.index) -eq "TWSE" } | Select-Object -First 1)
+    $ot = ($mi | Where-Object { (SafeTrim $_.date) -eq $date -and (SafeTrim $_.index) -eq "TPEx" } | Select-Object -First 1)
+    $twClose = $(if($null -ne $tw){ To-Num $tw.close $null } else { $null })
+    $twPct   = $(if($null -ne $tw){ To-Num $tw.change_percent $null } else { $null })
+    $otClose = $(if($null -ne $ot){ To-Num $ot.close $null } else { $null })
+    $otPct   = $(if($null -ne $ot){ To-Num $ot.change_percent $null } else { $null })
+    return @{
+      src="market_index_daily.csv"
+      twse_close=$twClose; twse_pct=$twPct
+      tpex_close=$otClose; tpex_pct=$otPct
+    }
+  }
+
+  # Fallback to IndexPath: index_code,date,close and compute pct from prev close
+  $idx = TryLoadCsv $IndexPath
+  if($idx.Count -gt 0 -and ($idx[0].PSObject.Properties.Name -contains "index_code")){
+    $tw = Compute-IndexPctChange $idx "TWSE" $date
+    $ot = Compute-IndexPctChange $idx "OTC"  $date
+
+    $t = Parse-Date $date
+    $twClose = $null; $otClose = $null
+    if($null -ne $t){
+      $twRow = ($idx | Where-Object { (SafeTrim $_.index_code) -eq "TWSE" -and (Parse-Date (SafeTrim $_.date)) -le $t } | Sort-Object { Parse-Date (SafeTrim $_.date) } | Select-Object -Last 1)
+      $otRow = ($idx | Where-Object { (SafeTrim $_.index_code) -eq "OTC"  -and (Parse-Date (SafeTrim $_.date)) -le $t } | Sort-Object { Parse-Date (SafeTrim $_.date) } | Select-Object -Last 1)
+      if($null -ne $twRow){ $twClose = To-Num $twRow.close $null }
+      if($null -ne $otRow){ $otClose = To-Num $otRow.close $null }
+    }
+
+    return @{
+      src="index_daily.csv"
+      twse_close=$twClose; twse_pct=$tw.pct
+      tpex_close=$otClose; tpex_pct=$ot.pct
+    }
+  }
+
+  return @{
+    src="n/a"
+    twse_close=$null; twse_pct=$null
+    tpex_close=$null; tpex_pct=$null
+  }
+}
+
+function Compute-BreadthAndSector([object[]]$dailyRows){
+  # expects rows for a single date
+  $up=0; $down=0; $flat=0
+  $scores = @()
+  $chg = @()
+
+  $sectorAgg = @{}  # sector -> @{count, up, sumScore, sumChg}
+  foreach($r in $dailyRows){
+    $cp = $null
+    if($r.PSObject.Properties.Name -contains "change_percent"){ $cp = To-Num $r.change_percent $null }
+    $ts = $null
+    if($r.PSObject.Properties.Name -contains "total_score"){ $ts = To-Num $r.total_score $null }
+
+    if($null -ne $cp){
+      $chg += [double]$cp
+      if($cp -gt 0){ $up++ } elseif($cp -lt 0){ $down++ } else { $flat++ }
+    }
+
+    if($null -ne $ts){ $scores += [double]$ts }
+
+    $sec = $(if($r.PSObject.Properties.Name -contains "sector"){ SafeTrim $r.sector } else { "" })
+    if([string]::IsNullOrWhiteSpace($sec)){ $sec = "(unknown)" }
+
+    if(-not $sectorAgg.ContainsKey($sec)){
+      $sectorAgg[$sec] = @{ count=0; up=0; sumScore=0.0; sumChg=0.0; chgN=0; scoreN=0 }
+    }
+    $sectorAgg[$sec].count++
+    if($null -ne $cp){
+      if($cp -gt 0){ $sectorAgg[$sec].up++ }
+      $sectorAgg[$sec].sumChg += [double]$cp
+      $sectorAgg[$sec].chgN++
+    }
+    if($null -ne $ts){
+      $sectorAgg[$sec].sumScore += [double]$ts
+      $sectorAgg[$sec].scoreN++
+    }
+  }
+
+  $avgChg = $(if($chg.Count -gt 0){ ($chg | Measure-Object -Average).Average } else { $null })
+
+  $scoreP25=$null; $scoreP50=$null; $scoreP75=$null
+  if($scores.Count -gt 0){
+    $s = $scores | Sort-Object
+    $n = $s.Count
+    function PickPct($arr, $p){
+      $idx = [math]::Floor(($arr.Count-1) * $p)
+      return [double]$arr[$idx]
+    }
+    $scoreP25 = PickPct $s 0.25
+    $scoreP50 = PickPct $s 0.50
+    $scoreP75 = PickPct $s 0.75
+  }
+
+  # Sector list
+  $sectors = @()
+  foreach($k in $sectorAgg.Keys){
+    $a = $sectorAgg[$k]
+    $avgScore = $(if($a.scoreN -gt 0){ $a.sumScore / $a.scoreN } else { $null })
+    $avgSecChg= $(if($a.chgN -gt 0){ $a.sumChg / $a.chgN } else { $null })
+    $upRatio  = $(if($a.count -gt 0){ ([double]$a.up / [double]$a.count) * 100.0 } else { $null })
+    $sectors += [pscustomobject]@{
+      sector=$k
+      count=$a.count
+      avg_score=$avgScore
+      avg_change=$avgSecChg
+      up_ratio=$upRatio
+    }
+  }
+
+  # ranking: by avg_score desc
+  $sectors = $sectors | Sort-Object { $_.avg_score } -Descending
+
+  # Simple suggestion text
+  $suggest = "n/a"
+  if($null -ne $scoreP75){
+    $suggest = ("分數區間參考：> P75({0:N1}) 偏強；介於 P50({1:N1})~P75 偏多觀察；< P50({2:N1}) 保守。" -f $scoreP75,$scoreP50,$scoreP50)
+  }
+
+  return @{
+    up=$up; down=$down; flat=$flat
+    avg_change=$avgChg
+    p25=$scoreP25; p50=$scoreP50; p75=$scoreP75
+    sectors=$sectors
+    suggest=$suggest
+  }
+}
+
+# =========================
+# Ensure OutDir
+# =========================
+if (!(Test-Path $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
+
+# =========================
+# ListDates mode
+# =========================
+if($ListDates){
+  $dec = TryLoadCsv $DecisionsPath
+  $fb  = TryLoadCsv $FallbackPath
+  $idx = TryLoadCsv $IndexPath
+  $mi  = TryLoadCsv $MarketIndexPath
+
+  Write-Host "=== Available Dates ===" -ForegroundColor Cyan
+  Show-DateSummary ("Decisions: " + $DecisionsPath) $dec
+  Show-DateSummary ("Daily:     " + $FallbackPath)  $fb
+  Show-DateSummary ("Index:     " + $IndexPath)     $idx
+  Show-DateSummary ("MktIndex:  " + $MarketIndexPath) $mi
+  return
+}
+
+# =========================
+# Load data (prefer decisions)
+# =========================
+$useDecisions = $false
+$rows = @()
+
+$tmp = TryLoadCsv $DecisionsPath
+if($tmp.Count -gt 0){
+  $rows = $tmp
+  $useDecisions = $true
+} else {
+  $tmp2 = TryLoadCsv $FallbackPath
+  if($tmp2.Count -eq 0){
+    throw "Missing data: $DecisionsPath and $FallbackPath"
+  }
+  $rows = $tmp2
+}
+if($rows.Count -eq 0){ throw "No rows loaded." }
+
+# =========================
+# Determine date + fallback
+# =========================
+$origRows = $rows
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  if($rows[0].PSObject.Properties.Name -contains "date"){
+    $Date = SafeTrim $rows[0].date
+  }
+}
+if([string]::IsNullOrWhiteSpace($Date)){
+  $Date = (Get-Date -Format "yyyy-MM-dd")
+}
+
+if($rows[0].PSObject.Properties.Name -contains "date"){
+  $rows = $rows | Where-Object { (SafeTrim $_.date) -eq $Date }
+
+  if($rows.Count -eq 0){
+    $latest = Get-LatestDateFromRows $origRows
+    if($latest -ne "" -and $latest -ne $Date){
+      Write-Host ("[WARN] No rows for Date={0}. Fallback to latest available date: {1}" -f $Date, $latest) -ForegroundColor Yellow
+      $Date = $latest
+      $rows = $origRows | Where-Object { (SafeTrim $_.date) -eq $Date }
+    }
+  }
+}
+
+if($rows.Count -eq 0){
+  throw "No rows after date filter: $Date"
+}
+
+# =========================
+# Market regime fields (if present)
+# =========================
+$marketRisk = ""
+$allowNew = ""
+
+if($useDecisions -and $rows.Count -gt 0){
+  if($rows[0].PSObject.Properties.Name -contains "market_risk"){ $marketRisk = SafeTrim $rows[0].market_risk }
+  if($rows[0].PSObject.Properties.Name -contains "gate_market"){ $allowNew = SafeTrim $rows[0].gate_market }
+}
+
+# =========================
+# Load daily rows for breadth/sector (always from FallbackPath)
+# =========================
+$dailyAll = TryLoadCsv $FallbackPath
+if($dailyAll.Count -eq 0){ throw "Missing daily file: $FallbackPath" }
+
+$dailyForDate = $dailyAll | Where-Object { (SafeTrim $_.date) -eq $Date }
+if($dailyForDate.Count -eq 0){
+  $latestDaily = Get-LatestDateFromRows $dailyAll
+  if($latestDaily -ne "" -and $latestDaily -ne $Date){
+    Write-Host ("[WARN] Daily has no rows for Date={0}. Fallback to latest daily date: {1}" -f $Date, $latestDaily) -ForegroundColor Yellow
+    $Date = $latestDaily
+    $dailyForDate = $dailyAll | Where-Object { (SafeTrim $_.date) -eq $Date }
+    # also refilter main rows for display
+    $rows = $origRows | Where-Object { (SafeTrim $_.date) -eq $Date }
+  }
+}
+
+$breadth = Compute-BreadthAndSector $dailyForDate
+
+# =========================
+# Market index snapshot (TWSE / TPEx)
+# =========================
+$idxSnap = Get-MarketIndexSnapshot $Date
+$twseClose = $idxSnap.twse_close
+$twsePct   = $idxSnap.twse_pct
+$tpexClose = $idxSnap.tpex_close
+$tpexPct   = $idxSnap.tpex_pct
+
+function DispIndex($close,$pct){
+  $c = $(if($null -ne $close){ "{0:N0}" -f [double]$close } else { "n/a" })
+  $p = $(if($null -ne $pct){ Format-Pct([double]$pct) } else { "n/a" })
+  return "$c ($p)"
+}
+
+$twseDisp = DispIndex $twseClose $twsePct
+$tpexDisp = DispIndex $tpexClose $tpexPct
+
+# =========================
+# Picks table (from decisions if available)
+# =========================
+$picks = @()
+if($useDecisions){
+  # expected cols: code, name(optional), score(optional), decision(optional)
+  $tmpP = $rows
+  if($tmpP[0].PSObject.Properties.Name -contains "score"){
+    $tmpP = $tmpP | Sort-Object { To-Num $_.score 0 } -Descending
+  } elseif($tmpP[0].PSObject.Properties.Name -contains "total_score"){
+    $tmpP = $tmpP | Sort-Object { To-Num $_.total_score 0 } -Descending
+  }
+  $picks = $tmpP | Select-Object -First 50
+} else {
+  $tmpP = $rows
+  if($tmpP[0].PSObject.Properties.Name -contains "total_score"){
+    $tmpP = $tmpP | Sort-Object { To-Num $_.total_score 0 } -Descending
+  }
+  $picks = $tmpP | Select-Object -First 50
+}
+
+# =========================
+# HTML
+# =========================
+$genDate = Get-Date
+$stampDay = $Date.Replace("-","")
+$stampGen = $genDate.ToString("yyyyMMdd_HHmmss")
+$outName = ("tw_dashboard_{0}_{1}.html" -f $stampDay, $stampGen)
+$outPath = Join-Path $OutDir $outName
+$css = @'
+:root{
+  --bg:#0b1220; --card:#111a2d; --muted:#9fb0d0; --text:#e8efff; --accent:#4dd2ff;
+  --good:#37d67a; --bad:#ff5c7a; --warn:#ffd166;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,'Noto Sans TC',sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:1200px;margin:0 auto;padding:18px}
+h1{margin:0 0 6px 0;font-size:22px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:14px}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.card{background:var(--card);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:14px}
+.card h2{margin:0 0 8px 0;font-size:14px;color:var(--muted);font-weight:600}
+.kpi{display:flex;gap:10px;flex-wrap:wrap}
+.k{min-width:180px;flex:1;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.05);border-radius:12px;padding:10px}
+.k .t{color:var(--muted);font-size:12px}
+.k .v{font-size:18px;margin-top:4px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid rgba(255,255,255,0.12);color:var(--muted)}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,0.06);font-size:13px}
+th{color:var(--muted);text-align:left;font-weight:600}
+.right{text-align:right}
+.small{font-size:12px;color:var(--muted)}
+.good{color:var(--good)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+"@
+
+function PctClass($v){
+  if($null -eq $v){ return "" }
+  if([double]$v -gt 0){ return "good" }
+  if([double]$v -lt 0){ return "bad" }
+  return ""
+}
+
+$twsePctCls = PctClass $twsePct
+$tpexPctCls = PctClass $tpexPct
+
+$breadthLine = ("{0} {1} ={2}" -f $breadth.up,$breadth.down,$breadth.flat)
+$avgChgDisp = $(if($null -ne $breadth.avg_change){ Format-Pct([double]$breadth.avg_change) } else { "n/a" })
+$avgChgCls  = PctClass $breadth.avg_change
+
+$regimeText = ""
+if(($marketRisk -ne "") -or ($allowNew -ne "")){
+  $regimeText = ("風險: {0}｜新單: {1}" -f (HtmlEscape $marketRisk),(HtmlEscape $allowNew))
+}
+
+# Sector heat top 10
+$sectorTop = @()
+if($breadth.sectors -and $breadth.sectors.Count -gt 0){
+  $sectorTop = $breadth.sectors | Select-Object -First 10
+}
+
+# Build picks rows HTML
+$pickRowsHtml = ""
+foreach($r in $picks){
+  $code = $(if($r.PSObject.Properties.Name -contains "code"){ HtmlEscape (SafeTrim $r.code) } else { "" })
+  $name = ""
+  if($r.PSObject.Properties.Name -contains "name"){ $name = HtmlEscape (SafeTrim $r.name) }
+
+  $decision = ""
+  if($r.PSObject.Properties.Name -contains "decision"){ $decision = HtmlEscape (SafeTrim $r.decision) }
+
+  $score = $null
+  if($r.PSObject.Properties.Name -contains "score"){ $score = To-Num $r.score $null }
+  elseif($r.PSObject.Properties.Name -contains "total_score"){ $score = To-Num $r.total_score $null }
+
+  $scoreDisp = $(if($null -ne $score){ "{0:N1}" -f [double]$score } else { "" })
+
+  $pickRowsHtml += "<tr><td>$code</td><td>$name</td><td>$decision</td><td class='right'>$scoreDisp</td></tr>`n"
+}
+
+# Build sector rows HTML
+$sectorRowsHtml = ""
+foreach($s in $sectorTop){
+  $sec = HtmlEscape (SafeTrim $s.sector)
+  $cnt = [int]$s.count
+  $as  = $(if($null -ne $s.avg_score){ "{0:N1}" -f [double]$s.avg_score } else { "n/a" })
+  $acv = $(if($null -ne $s.avg_change){ [double]$s.avg_change } else { $null })
+  $ac  = $(if($null -ne $acv){ Format-Pct $acv } else { "n/a" })
+  $acCls = PctClass $acv
+  $ur  = $(if($null -ne $s.up_ratio){ "{0:N0}%" -f [double]$s.up_ratio } else { "n/a" })
+  $sectorRowsHtml += "<tr><td>$sec</td><td class='right'>$cnt</td><td class='right'>$as</td><td class='right $acCls'>$ac</td><td class='right'>$ur</td></tr>`n"
+}
+
+$html = @"
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TW Dashboard $Date</title>
+<style>$css</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>台股 Dashboard</h1>
+    <div class="sub">
+      日期：<span class="badge">$Date</span>
+      &nbsp;資金：<span class="badge">$("{0:N0}" -f $Capital)</span>
+      &nbsp;Top：<span class="badge">$Top</span>
+      &nbsp;<span class="small">IndexSrc: $($idxSnap.src)</span>
+      <div class="small">$regimeText</div>
+    </div>
+
+    <div class="grid">
+      <div class="card" style="grid-column:span 12">
+        <h2>市場盤口總覽</h2>
+        <div class="kpi">
+          <div class="k"><div class="t">加權指數 TWSE</div><div class="v $twsePctCls">$twseDisp</div></div>
+          <div class="k"><div class="t">櫃買指數 TPEx</div><div class="v $tpexPctCls">$tpexDisp</div></div>
+          <div class="k"><div class="t">漲跌家數</div><div class="v">$breadthLine</div></div>
+          <div class="k"><div class="t">平均漲跌</div><div class="v $avgChgCls">$avgChgDisp</div></div>
+        </div>
+        <div class="small" style="margin-top:10px">
+          $([HtmlEscape]::new($breadth.suggest))
+        </div>
+      </div>
+
+      <div class="card" style="grid-column:span 6">
+        <h2>類股熱度 Top 10（以平均分數排序）</h2>
+        <table>
+          <thead><tr><th>類股</th><th class="right">樣本</th><th class="right">平均分</th><th class="right">平均漲跌</th><th class="right">上漲比</th></tr></thead>
+          <tbody>
+            $sectorRowsHtml
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="grid-column:span 6">
+        <h2>今日候選清單（Top 50）</h2>
+        <table>
+          <thead><tr><th>代碼</th><th>名稱</th><th>建議</th><th class="right">分數</th></tr></thead>
+          <tbody>
+            $pickRowsHtml
+          </tbody>
+        </table>
+        <div class="small" style="margin-top:8px">資料源：$([string]::new($(if($useDecisions){"decisions"}else{"daily"}))) / 日期：$Date</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"@
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($outPath, $html.Replace("`r`n","`n").Replace("`n","`r`n"), $utf8NoBom)
+Write-Host ("OK: wrote HTML -> {0}" -f $outPath) -ForegroundColor Green
+
+if($Open){
+  Start-Process $outPath | Out-Null
+}

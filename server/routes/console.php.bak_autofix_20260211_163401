@@ -1,0 +1,33 @@
+<?php
+
+use Illuminate\Support\Facades\Artisan;
+
+/*
+|--------------------------------------------------------------------------
+| Console Routes
+|--------------------------------------------------------------------------
+| This file is for defining closure based console commands.
+| Keep it PURE PHP — do not paste PowerShell here.
+*/
+
+// Fetch daily bars (TWSE snapshot; date arg kept for compatibility)
+Artisan::command('market:fetch-daily-bars {date?}', function ($date = null) {
+    $args = $date ? ['date' => $date] : [];
+    $this->call(\App\Console\Commands\Market\FetchDailyBars::class, $args);
+})->purpose('Fetch TWSE daily bars snapshot and upsert into stocks + daily_bars');
+
+// Generate daily report (scores + top20)
+Artisan::command('market:generate-daily-report {date}', function ($date) {
+    $this->call(\App\Console\Commands\Market\GenerateDailyReport::class, ['date' => $date]);
+})->purpose('Generate v1 daily scores + mixed Top20 + report snapshot');
+
+// Generate rule-based comment into daily_reports.ai_comment
+Artisan::command('market:comment {date}', function ($date) {
+    $this->call(\App\Console\Commands\Market\GenerateAiComment::class, ['date' => $date]);
+})->purpose('Generate rule-based Top20 comments into daily_reports.ai_comment');
+
+// Run full daily pipeline
+Artisan::command('market:run-daily {date?}', function ($date = null) {
+    $args = $date ? ['date' => $date] : [];
+    $this->call(\App\Console\Commands\Market\RunDaily::class, $args);
+})->purpose('Run full daily pipeline: fetch -> score/report -> comment');

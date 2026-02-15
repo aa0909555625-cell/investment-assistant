@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [int]$LookbackWeeks = 12,
   [switch]$DryRun

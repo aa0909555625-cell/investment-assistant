@@ -1,4 +1,4 @@
-﻿Write-Host "=== Investment Assistant :: Phase ④ Best Params + Backtest ==="
+Write-Host "=== Investment Assistant :: Phase ④ Best Params + Backtest ==="
 
 # ---------- 0. Guards ----------
 if (!(Test-Path data\metrics_sweep.csv)) {

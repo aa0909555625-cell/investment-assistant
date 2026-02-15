@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+"""
+Weekly Pipeline (v0.9+) - now includes:
+- Ranking (cross-sectional) for latest date
+- Breadth analyzer for latest date
+- Dynamic portfolio plan for latest date
+- Portfolio Backtest v3 (cross-sectional, dynamic holdings, costs)
+
+This file is designed to be executed by existing PowerShell runners.
+"""
+from __future__ import annotations
+import argparse
+import os
+import subprocess
+import sys
+import json
+from datetime import datetime
+import pandas as pd
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+def run(cmd: list[str]) -> None:
+    p = subprocess.run(cmd, cwd=ROOT)
+    if p.returncode != 0:
+        raise SystemExit(p.returncode)
+
+def read_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing: {path}")
+    try:
+        return pd.read_csv(path, dtype={"code": str})
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str})
+
+def latest_date_from_all_stocks(path: str) -> str:
+    df = read_csv(path)
+    if "date" not in df.columns:
+        raise ValueError("all_stocks_daily.csv missing 'date'")
+    d = sorted(df["date"].astype(str).unique().tolist())
+    if not d:
+        raise ValueError("No dates found in all_stocks_daily.csv")
+    return d[-1]
+
+def ensure_market_snapshot_csv():
+    # if you only have json, this is best-effort. We do not re-generate here.
+    # market_snapshot_taiex.csv should exist if you already built snapshot pipeline.
+    pass
+
+def write_weekly_summary(md_path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(md_path) or ".", exist_ok=True)
+    lines = []
+    lines.append("# Weekly Summary")
+    lines.append("")
+    lines.append(f"- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"- TargetDate: {payload.get('date','')}")
+    lines.append("")
+    lines.append("## Portfolio Plan")
+    pp = payload.get("portfolio_plan", {})
+    lines.append(f"- risk_mode: {pp.get('risk_mode')}")
+    lines.append(f"- holdings: {pp.get('holdings')}")
+    lines.append(f"- used_capital: {pp.get('used_capital')}")
+    lines.append(f"- cash_reserve: {pp.get('cash_reserve')}")
+    lines.append(f"- breadth_ratio: {pp.get('breadth_ratio')}")
+    lines.append("")
+    lines.append("## Backtest v3 KPI")
+    kpi = payload.get("backtest_v3", {})
+    lines.append(f"- final_equity: {kpi.get('final_equity')}")
+    lines.append(f"- total_return: {kpi.get('total_return')}")
+    lines.append(f"- annualized_return: {kpi.get('annualized_return')}")
+    lines.append(f"- max_drawdown: {kpi.get('max_drawdown')}")
+    lines.append(f"- sharpe: {kpi.get('sharpe')}")
+    lines.append(f"- bars: {kpi.get('bars')}")
+    lines.append("")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--capital", type=float, default=300000.0)
+    ap.add_argument("--top", type=int, default=200, help="ranking rows kept for the day")
+    ap.add_argument("--threshold", type=float, default=70.0, help="breadth score threshold")
+    ap.add_argument("--init_capital", type=float, default=1000000.0, help="backtest init equity")
+    ap.add_argument("--start", default="", help="backtest start date (optional)")
+    ap.add_argument("--end", default="", help="backtest end date (optional)")
+    ap.add_argument("--quiet", action="store_true")
+    args = ap.parse_args()
+
+    all_csv = os.path.join(ROOT, "data", "all_stocks_daily.csv")
+    date = latest_date_from_all_stocks(all_csv)
+
+    # 1) ranking
+    run([sys.executable, os.path.join("scripts","ranking_engine.py"),
+         "--date", date, "--top", str(args.top),
+         "--in_csv", os.path.join("data","all_stocks_daily.csv"),
+         "--out_csv", os.path.join("data", f"ranking_{date}.csv")])
+
+    # 2) breadth
+    run([sys.executable, os.path.join("scripts","breadth_analyzer.py"),
+         "--date", date,
+         "--threshold", str(args.threshold),
+         "--in_csv", os.path.join("data","all_stocks_daily.csv")])
+
+    # 3) portfolio plan
+    run([sys.executable, os.path.join("scripts","portfolio_engine.py"),
+         "--date", date,
+         "--capital", str(args.capital),
+         "--ranking_csv", os.path.join("data", f"ranking_{date}.csv"),
+         "--breadth_json", os.path.join("data", f"breadth_{date}.json"),
+         "--market_json", os.path.join("data", "market_snapshot_taiex.json"),
+         "--out_csv", os.path.join("data", f"portfolio_plan_{date}.csv")])
+
+    # 4) backtest v3 (cross-sectional portfolio)
+    bt_cmd = [sys.executable, os.path.join("scripts","backtest_portfolio_v3.py"),
+              "--in_csv", os.path.join("data","all_stocks_daily.csv"),
+              "--market_csv", os.path.join("data","market_snapshot_taiex.csv"),
+              "--out_csv", os.path.join("reports","portfolio_backtest_v3.csv"),
+              "--threshold", str(args.threshold),
+              "--init_capital", str(args.init_capital)]
+    if args.start:
+        bt_cmd += ["--start", args.start]
+    if args.end:
+        bt_cmd += ["--end", args.end]
+    run(bt_cmd)
+
+    # summary payload
+    plan_path = os.path.join(ROOT, "data", f"portfolio_plan_{date}.csv")
+    plan = read_csv(plan_path)
+    # plan may include 1 row (all cash) or N rows
+    if len(plan) >= 1:
+        pp0 = plan.iloc[0].to_dict()
+        portfolio_summary = {
+            "risk_mode": pp0.get("risk_mode"),
+            "holdings": int(pp0.get("holdings") or 0),
+            "used_capital": float(pp0.get("used_capital") or 0.0),
+            "cash_reserve": float(pp0.get("cash_reserve") or 0.0),
+            "breadth_ratio": float(pp0.get("breadth_ratio") or 0.0),
+        }
+    else:
+        portfolio_summary = {}
+
+    sum_json = os.path.join(ROOT, "reports", "portfolio_backtest_v3_summary.json")
+    if os.path.exists(sum_json):
+        with open(sum_json, "r", encoding="utf-8") as f:
+            kpi = json.load(f)
+    else:
+        kpi = {}
+
+    payload = {"date": date, "portfolio_plan": portfolio_summary, "backtest_v3": kpi}
+    write_weekly_summary(os.path.join(ROOT, "reports", "weekly_summary.md"), payload)
+
+    if not args.quiet:
+        print("=== PORTFOLIO v3 DONE ===")
+        print(f"date={date}")
+        print("plan:", plan_path)
+        print("backtest:", os.path.join(ROOT, "reports","portfolio_backtest_v3.csv"))
+        print("summary:", os.path.join(ROOT, "reports","weekly_summary.md"))
+
+if __name__ == "__main__":
+    main()

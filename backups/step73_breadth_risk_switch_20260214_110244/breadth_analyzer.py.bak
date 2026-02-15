@@ -1,0 +1,63 @@
+# -*- coding: utf-8 -*-
+"""
+Breadth Analyzer (Market Breadth)
+Input : data/all_stocks_daily.csv
+Output: data/breadth_<date>.json + .csv
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import pandas as pd
+
+def _read_csv(path: str) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path, dtype={"code": str})
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="utf-8-sig", dtype={"code": str})
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date", required=True)
+    ap.add_argument("--threshold", type=float, default=70.0, help="score threshold for breadth count")
+    ap.add_argument("--in_csv", default=r"data/all_stocks_daily.csv")
+    ap.add_argument("--out_json", default="")
+    ap.add_argument("--out_csv", default="")
+    args = ap.parse_args()
+
+    df = _read_csv(args.in_csv)
+    if "date" not in df.columns or "total_score" not in df.columns or "code" not in df.columns:
+        raise ValueError("data/all_stocks_daily.csv must contain: date, code, total_score")
+
+    d = df[df["date"].astype(str) == str(args.date)].copy()
+    if d.empty:
+        raise ValueError(f"No rows for date={args.date}")
+
+    d["total_score"] = pd.to_numeric(d["total_score"], errors="coerce")
+    d = d.dropna(subset=["total_score"])
+    total = int(d["code"].nunique())
+    above = int((d["total_score"] >= args.threshold).sum())
+    ratio = float(above / total) if total > 0 else 0.0
+
+    payload = {
+        "date": str(args.date),
+        "threshold": float(args.threshold),
+        "universe_count": total,
+        "above_threshold_count": above,
+        "breadth_ratio": ratio
+    }
+
+    out_json = args.out_json.strip() or f"data/breadth_{args.date}.json"
+    out_csv  = args.out_csv.strip()  or f"data/breadth_{args.date}.csv"
+    os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
+
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    pd.DataFrame([payload]).to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+    print(f"OK: wrote -> {out_json}")
+    print(f"OK: wrote -> {out_csv}")
+
+if __name__ == "__main__":
+    main()

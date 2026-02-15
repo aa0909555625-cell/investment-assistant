@@ -1,4 +1,4 @@
-﻿param(
+param(
   [string]$StockNo = "2330",
   [int]$MonthsBack = 14
 )

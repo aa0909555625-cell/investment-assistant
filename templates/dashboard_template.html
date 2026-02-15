@@ -1,0 +1,78 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Investment Dashboard __DATE__</title>
+  <style>
+    body{font-family:Segoe UI,Arial; margin:16px;}
+    .row{display:flex; gap:12px; flex-wrap:wrap;}
+    .card{border:1px solid #ddd; border-radius:10px; padding:12px; min-width:260px;}
+    .card-title{font-weight:700; margin-bottom:8px;}
+    .kpi-main{font-size:20px; font-weight:700;}
+    .kpi-sub{color:#666; margin-top:4px;}
+    .table{border-collapse:collapse; width:100%;}
+    .table th,.table td{border-bottom:1px solid #eee; padding:6px 8px; text-align:left;}
+    .kpi-grid{display:flex; gap:12px; flex-wrap:wrap;}
+    .kpi-box{border:1px dashed #ddd; border-radius:10px; padding:10px; min-width:260px;}
+    .kpi-label{color:#666; font-size:12px;}
+    .muted{color:#888;}
+    .split{display:flex; gap:12px; flex-wrap:wrap;}
+    .w-full{width:100%;}
+  </style>
+</head>
+<body>
+  <h1>Market Dashboard (__DATE__)</h1>
+
+  <div class="row">__INDICES_BLOCK__</div>
+
+  <div class="split">
+    <div class="card">
+      <div class="card-title">KPIs</div>
+      __KPI_BLOCK__
+    </div>
+
+    <div class="card">
+      <div class="card-title">Score Band</div>
+      <div class="kpi-main">__BAND__</div>
+      <div class="kpi-sub">__SUGGESTED_POS__</div>
+    </div>
+  </div>
+
+  <div class="row">__MARKET_BREADTH__</div>
+  <div class="row">__REGIME_BLOCK__
+  <div class="row">__DECISION_BLOCK__</div></div>
+
+  <div class="row">
+    __HOT_ZONES__
+    __WEAK_ZONES__
+  </div>
+
+  <div class="w-full">__TOP_BLOCK__</div>
+<script id="RegimeLabelMap_v1">
+(function(){
+  function mapRegime(x){
+    x = (x||"").trim();
+    if(x === "Trend") return "趨勢盤";
+    if(x === "Range") return "震盪盤";
+    if(x === "HighVolatility") return "高波動盤";
+    return x;
+  }
+
+  // Find the "Market Thermometer (Regime)" card and replace its main regime label
+  var titles = document.querySelectorAll(".card-title");
+  for(var i=0;i<titles.length;i++){
+    var t = titles[i];
+    if((t.textContent||"").indexOf("Market Thermometer (Regime)") >= 0){
+      var card = t.closest(".card");
+      if(!card) continue;
+      var mains = card.querySelectorAll(".kpi-main");
+      if(mains && mains.length > 0){
+        mains[0].textContent = mapRegime(mains[0].textContent);
+      }
+      break;
+    }
+  }
+})();
+</script>
+</body>
+</html>

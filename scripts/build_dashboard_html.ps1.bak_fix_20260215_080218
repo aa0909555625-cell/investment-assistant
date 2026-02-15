@@ -1,0 +1,281 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [string]$OutDir = ".\reports",
+  [switch]$Open,
+  [switch]$ListDates
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function HtmlEncode([string]$s){
+  if($null -eq $s){ return "" }
+  return [System.Net.WebUtility]::HtmlEncode($s)
+}
+function FormatPct($x){
+  if($null -eq $x){ return "" }
+  try { return ("{0:N2}%" -f ([double]$x)) } catch { return "$x" }
+}
+function FormatNum($x){
+  if($null -eq $x){ return "" }
+  try { return ("{0:N0}" -f ([double]$x)) } catch { return "$x" }
+}
+
+# StrictMode-safe property getter
+function GetProp([object]$o, [string]$name, $default = $null){
+  if($null -eq $o){ return $default }
+  $p = $o.PSObject.Properties[$name]
+  if($null -ne $p){ return $p.Value }
+  return $default
+}
+function GetFirstProp([object]$o, [string[]]$names, $default = ""){
+  foreach($n in $names){
+    $v = GetProp $o $n $null
+    if($null -ne $v -and ("$v").Trim().Length -gt 0){ return $v }
+  }
+  return $default
+}
+function WriteUtf8NoBom([string]$path, [string]$content){
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  $norm = $content.Replace("`r`n","`n").Replace("`n","`r`n")
+  [System.IO.File]::WriteAllText($path, $norm, $utf8NoBom)
+}
+
+$OutDirFull = (Resolve-Path $OutDir).Path
+
+if($ListDates){
+  Get-ChildItem -Path $OutDirFull -Filter "market_snapshot_*.json" -File |
+    ForEach-Object {
+      if($_.Name -match '^market_snapshot_(\d{4}-\d{2}-\d{2})\.json$'){ $matches[1] }
+    } | Sort-Object
+  exit 0
+}
+
+if([string]::IsNullOrWhiteSpace($Date)){
+  $latest = Get-ChildItem -Path $OutDirFull -Filter "market_snapshot_*.json" -File |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  if($null -eq $latest){ throw "No market_snapshot_*.json found in $OutDirFull" }
+  if($latest.Name -match '^market_snapshot_(\d{4}-\d{2}-\d{2})\.json$'){ $Date = $matches[1] }
+  else { throw "Cannot parse date from $($latest.Name)" }
+}
+
+$snapPath = Join-Path $OutDirFull ("market_snapshot_{0}.json" -f $Date)
+$idxPath  = Join-Path $OutDirFull ("indices_{0}.json" -f $Date)
+$outHtml  = Join-Path $OutDirFull ("dashboard_{0}.html" -f $Date)
+
+if(!(Test-Path $snapPath)){ throw "Snapshot json not found: $snapPath" }
+$snap = (Get-Content $snapPath -Raw -Encoding UTF8) | ConvertFrom-Json
+
+$idx = $null
+if(Test-Path $idxPath){
+  try { $idx = (Get-Content $idxPath -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $idx = $null }
+}
+
+# ---- tape summary (StrictMode-safe) ----
+$band = ""
+$strategy = ""
+$suggestedPos = ""
+$hotZones = @()
+$weakZones = @()
+
+$tape = GetProp $snap "tape_summary" $null
+if($null -ne $tape){
+  $band = HtmlEncode (GetProp $tape "band" "")
+  $strategy = HtmlEncode (GetProp $tape "strategy" "")
+
+  $sp = GetProp $tape "suggested_position" $null
+  if($null -ne $sp){
+    try { $suggestedPos = ("{0:P0}" -f ([double]$sp)) } catch { $suggestedPos = "$sp" }
+  }
+
+  $hz = GetProp $tape "hot_zones" $null
+  $wz = GetProp $tape "weak_zones" $null
+  if($null -ne $hz){ $hotZones = @($hz) }
+  if($null -ne $wz){ $weakZones = @($wz) }
+}
+
+# ---- indices block (object style: taiex/tpex + array style) ----
+$indicesBlock = ""
+if($null -ne $idx){
+  $rows = @()
+
+  $nameKeys  = @("name","symbol","index","id")
+  $levelKeys = @("last","level","close","value","price","index_level","idx_level")
+  $chgKeys   = @("change_percent","chg_percent","changePct","pct_change","change_pct")
+
+  if($idx -is [System.Collections.IEnumerable] -and $idx -isnot [pscustomobject]){
+    foreach($it in $idx){
+      if($null -eq $it){ continue }
+      $nameRaw  = GetFirstProp $it $nameKeys "Index"
+      $levelRaw = GetFirstProp $it $levelKeys ""
+      $chgRaw   = GetFirstProp $it $chgKeys ""
+      $name  = HtmlEncode ("$nameRaw")
+      $level = HtmlEncode ("$levelRaw")
+      $chg   = HtmlEncode (FormatPct $chgRaw)
+      $rows += "<tr><td>$name</td><td class='num'>$level</td><td class='num'>$chg</td></tr>"
+    }
+  } else {
+    foreach($p in $idx.PSObject.Properties){
+      if($p.Name -in @("source","fetched_at")){ continue }
+      $it = $p.Value
+      if($null -eq $it){ continue }
+      $nameRaw  = $p.Name
+      $levelRaw = GetFirstProp $it $levelKeys ""
+      $chgRaw   = GetFirstProp $it $chgKeys ""
+      $name  = HtmlEncode ("$nameRaw")
+      $level = HtmlEncode ("$levelRaw")
+      $chg   = HtmlEncode (FormatPct $chgRaw)
+      $rows += "<tr><td>$name</td><td class='num'>$level</td><td class='num'>$chg</td></tr>"
+    }
+  }
+
+  if($rows.Count -gt 0){
+    $block = @()
+    $block += '<div class="card">'
+    $block += '  <div class="card-h">指數</div>'
+    $block += '  <table>'
+    $block += '    <thead><tr><th>名稱</th><th class="num">點位</th><th class="num">漲跌%</th></tr></thead>'
+    $block += '    <tbody>'
+    $block += ($rows | ForEach-Object { "      $_" })
+    $block += '    </tbody>'
+    $block += '  </table>'
+    $block += '</div>'
+    $indicesBlock = ($block -join "`n")
+  }
+}
+
+# ---- chips ----
+$hotHtml = ""
+if($hotZones.Count -gt 0){
+  $hotHtml = "<div class='chips'>" + (($hotZones | ForEach-Object { "<span class='chip hot'>" + (HtmlEncode "$_") + "</span>" }) -join "") + "</div>"
+}
+$weakHtml = ""
+if($weakZones.Count -gt 0){
+  $weakHtml = "<div class='chips'>" + (($weakZones | ForEach-Object { "<span class='chip weak'>" + (HtmlEncode "$_") + "</span>" }) -join "") + "</div>"
+}
+
+# ---- KPI (StrictMode-safe, NEVER touch $snap.kpi directly) ----
+$kpiBlock = ""
+$kpiObj = GetProp $snap "kpi" $null
+if($null -ne $kpiObj){
+  $cards = @()
+  foreach($p in $kpiObj.PSObject.Properties){
+    $k = HtmlEncode ($p.Name)
+    $v = HtmlEncode ("$($p.Value)")
+    $cards += "<div class='kpi'><div class='k'>$k</div><div class='v'>$v</div></div>"
+  }
+  if($cards.Count -gt 0){
+    $kpiBlock = "<div class='card'><div class='card-h'>KPI</div><div class='kpis'>" + ($cards -join "") + "</div></div>"
+  }
+}
+
+# ---- Top picks (StrictMode-safe) ----
+$topBlock = ""
+$tp = GetProp $snap "top_picks" $null
+if($null -ne $tp){
+  $trs = @()
+  foreach($it in @($tp)){
+    if($null -eq $it){ continue }
+    $code   = HtmlEncode (GetProp $it "code" "")
+    $name   = HtmlEncode (GetProp $it "name" "")
+    $sector = HtmlEncode (GetProp $it "sector" "")
+    $chg    = HtmlEncode (FormatPct (GetProp $it "change_percent" ""))
+    $score  = HtmlEncode ("" + (GetProp $it "total_score" ""))
+    $trs += "<tr><td>$code</td><td>$name</td><td>$sector</td><td class='num'>$chg</td><td class='num'>$score</td></tr>"
+  }
+
+  if($trs.Count -gt 0){
+    $b = @()
+    $b += '<div class="card">'
+    $b += ("  <div class=""card-h"">Top Picks（Top={0}）</div>" -f (HtmlEncode (FormatNum $Top)))
+    $b += '  <table>'
+    $b += '    <thead><tr><th>代碼</th><th>名稱</th><th>類股</th><th class="num">漲跌%</th><th class="num">總分</th></tr></thead>'
+    $b += '    <tbody>'
+    $b += ($trs | ForEach-Object { "      $_" })
+    $b += '    </tbody>'
+    $b += '  </table>'
+    $b += '</div>'
+    $topBlock = ($b -join "`n")
+  }
+}
+
+# ---- HTML template ----
+$tpl = @(
+'<!DOCTYPE html>',
+'<html lang="zh-Hant">',
+'<head>',
+'  <meta charset="utf-8"/>',
+'  <meta name="viewport" content="width=device-width, initial-scale=1"/>',
+'  <title>Investment Assistant Dashboard :: __DATE__</title>',
+'  <style>',
+'    body{font-family:Segoe UI,Microsoft JhengHei,Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:18px}',
+'    .wrap{max-width:1200px;margin:0 auto}',
+'    .topbar{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-bottom:14px}',
+'    .title{font-size:20px;font-weight:700}',
+'    .sub{opacity:.75;font-size:13px}',
+'    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}',
+'    @media (max-width: 900px){ .grid{grid-template-columns:1fr} }',
+'    .card{background:#111a2d;border:1px solid #22304f;border-radius:14px;padding:12px 12px 10px 12px;box-shadow:0 6px 18px rgba(0,0,0,.22)}',
+'    .card-h{font-weight:700;margin-bottom:8px}',
+'    table{width:100%;border-collapse:collapse}',
+'    th,td{border-bottom:1px solid #22304f;padding:8px 6px;font-size:13px}',
+'    th{opacity:.85;text-align:left}',
+'    td.num,th.num{text-align:right}',
+'    .chips{display:flex;gap:8px;flex-wrap:wrap}',
+'    .chip{display:inline-block;padding:6px 10px;border-radius:999px;font-size:13px;border:1px solid #2a3a60}',
+'    .chip.hot{background:rgba(255,90,90,.12)}',
+'    .chip.weak{background:rgba(120,170,255,.10)}',
+'    .kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}',
+'    @media (max-width: 900px){ .kpis{grid-template-columns:repeat(2,minmax(0,1fr))} }',
+'    .kpi{background:#0e1730;border:1px solid #22304f;border-radius:12px;padding:10px}',
+'    .kpi .k{opacity:.75;font-size:12px}',
+'    .kpi .v{font-size:16px;font-weight:700;margin-top:4px}',
+'    .band{font-weight:800}',
+'  </style>',
+'</head>',
+'<body>',
+'<div class="wrap">',
+'  <div class="topbar">',
+'    <div>',
+'      <div class="title">市場盤口總覽 :: __DATE__</div>',
+'      <div class="sub">Capital=__CAPITAL__ ｜ Top=__TOP__</div>',
+'    </div>',
+'    <div style="margin-left:auto">',
+'      <div class="sub">Band：<span class="band">__BAND__</span></div>',
+'      <div class="sub">建議持倉：__SUGGESTED_POS__</div>',
+'    </div>',
+'  </div>',
+'  <div class="grid">',
+'    __INDICES_BLOCK__',
+'    __KPI_BLOCK__',
+'    <div class="card"><div class="card-h">Hot Zones</div>__HOT_ZONES__</div>',
+'    <div class="card"><div class="card-h">Weak Zones</div>__WEAK_ZONES__</div>',
+'    <div class="card" style="grid-column:1 / -1"><div class="card-h">盤口摘要</div><div>__STRATEGY__</div></div>',
+'    <div style="grid-column:1 / -1">__TOP_BLOCK__</div>',
+'  </div>',
+'</div>',
+'</body>',
+'</html>'
+) -join "`n"
+
+$html = $tpl
+$html = $html.Replace("__DATE__", (HtmlEncode $Date))
+$html = $html.Replace("__CAPITAL__", (HtmlEncode (FormatNum $Capital)))
+$html = $html.Replace("__TOP__", (HtmlEncode (FormatNum $Top)))
+$html = $html.Replace("__BAND__", $band)
+$html = $html.Replace("__SUGGESTED_POS__", (HtmlEncode $suggestedPos))
+$html = $html.Replace("__STRATEGY__", $strategy)
+$html = $html.Replace("__HOT_ZONES__", $hotHtml)
+$html = $html.Replace("__WEAK_ZONES__", $weakHtml)
+$html = $html.Replace("__INDICES_BLOCK__", $indicesBlock)
+$html = $html.Replace("__KPI_BLOCK__", $kpiBlock)
+$html = $html.Replace("__TOP_BLOCK__", $topBlock)
+
+WriteUtf8NoBom $outHtml $html
+Write-Host ("OK: wrote HTML -> {0}" -f $outHtml) -ForegroundColor Green
+if($Open){ Start-Process $outHtml | Out-Null }
+exit 0

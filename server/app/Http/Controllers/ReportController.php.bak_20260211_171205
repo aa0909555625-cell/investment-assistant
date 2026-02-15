@@ -1,0 +1,62 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Support\Facades\DB;
+
+class ReportController extends Controller
+{
+    private function scoreAction(int $score): array
+    {
+        // 規則型分段：用於「偏買/觀望/偏賣」視覺提示（非投資建議）
+        if ($score >= 75) return ['label' => '偏買進/加碼', 'zone' => 'buy'];
+        if ($score >= 60) return ['label' => '小額試單（偏買）', 'zone' => 'buy-lite'];
+        if ($score >= 40) return ['label' => '觀望/持有', 'zone' => 'hold'];
+        return ['label' => '偏賣出/避開', 'zone' => 'sell'];
+    }
+
+    public function today()
+    {
+        $date = DB::table('daily_reports')
+            ->orderByDesc('date')
+            ->value('date');
+
+        if (!$date) {
+            abort(404, 'No report found');
+        }
+
+        return redirect()->route('report.show', ['date' => $date]);
+    }
+
+    public function show(string $date)
+    {
+        $report = DB::table('daily_reports')->where('date', $date)->first();
+        if (!$report) {
+            abort(404, 'Report not found');
+        }
+
+        $top20 = json_decode($report->top20, true) ?: [];
+
+        // Top1 分數（第一筆）
+        $top1Score = isset($top20[0]['score_total']) ? (int)$top20[0]['score_total'] : 0;
+
+        // Top20 平均分數
+        $scores = array_map(fn($r) => (int)($r['score_total'] ?? 0), $top20);
+        $avgScore = count($scores) ? (int) round(array_sum($scores) / count($scores)) : 0;
+
+        $top1Action = $this->scoreAction($top1Score);
+        $avgAction  = $this->scoreAction($avgScore);
+
+        return view('report.show', [
+            'date' => $report->date,
+            'top20' => $top20,
+            'ai_comment' => $report->ai_comment,
+
+            // 分析圖需要的資料
+            'top1_score' => $top1Score,
+            'avg_score' => $avgScore,
+            'top1_action' => $top1Action,
+            'avg_action' => $avgAction,
+        ]);
+    }
+}

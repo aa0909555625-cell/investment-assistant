@@ -1,0 +1,343 @@
+# Portfolio Backtest v3 (Cross-sectional, dynamic holdings, risk switch, costs)
+# FIX (2026-02-14):
+# - No same-day lookahead: decide holdings at d0, realize returns at d1
+# - Allow negative returns (no clipping)
+# - Turnover computed from holdings overlap
+# - Proper equity + drawdown
+# - Accept --threshold to avoid weekly_pipeline arg mismatch (ignored)
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set, Tuple
+
+import pandas as pd
+
+
+def read_csv_safe(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    # keep source/code as str to avoid mixed dtype warnings
+    return pd.read_csv(path, dtype={"code": str, "source": str}, low_memory=False)
+
+
+def write_placeholder(out_csv: str, out_json: str, init_capital: float, note: str) -> None:
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    pd.DataFrame(
+        columns=[
+            "date","prev_date","risk_mode","market_ok","trend_ok","breadth_metric",
+            "holdings","turnover","gross_return","cost_frac","net_return","equity","drawdown"
+        ]
+    ).to_csv(out_csv, index=False, encoding="utf-8")
+
+    os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
+    payload = {
+        "init_capital": float(init_capital),
+        "final_equity": float(init_capital),
+        "total_return": 0.0,
+        "annualized_return": 0.0,
+        "max_drawdown": 0.0,
+        "sharpe": 0.0,
+        "bars": 0,
+        "note": note,
+    }
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def safe_float(x, default=math.nan) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float):
+            return x
+        s = str(x).strip()
+        if s == "" or s.lower() == "nan":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def compute_sharpe(daily_returns: List[float]) -> float:
+    # simple sharpe (mean/std * sqrt(N)) on bar returns
+    if len(daily_returns) < 2:
+        return 0.0
+    mu = sum(daily_returns) / len(daily_returns)
+    var = sum((r - mu) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
+    sd = math.sqrt(var)
+    if sd <= 1e-12:
+        return 0.0
+    return (mu / sd) * math.sqrt(len(daily_returns))
+
+
+def compute_annualized(total_return: float, bars: int) -> float:
+    if bars <= 0:
+        return 0.0
+    # assume ~252 trading days
+    years = bars / 252.0
+    if years <= 0:
+        return 0.0
+    try:
+        return (1.0 + total_return) ** (1.0 / years) - 1.0
+    except Exception:
+        return 0.0
+
+
+def pick_holdings(df_rank_d0: pd.DataFrame, top_n: int) -> List[str]:
+    # expect already filtered by date==d0
+    # sort by total_score desc, tie by change_percent desc then code
+    tmp = df_rank_d0.copy()
+    if "total_score" in tmp.columns:
+        tmp["total_score"] = pd.to_numeric(tmp["total_score"], errors="coerce")
+    else:
+        tmp["total_score"] = math.nan
+    if "change_percent" in tmp.columns:
+        tmp["change_percent"] = pd.to_numeric(tmp["change_percent"], errors="coerce")
+    else:
+        tmp["change_percent"] = 0.0
+
+    tmp = tmp.sort_values(["total_score","change_percent","code"], ascending=[False, False, True])
+    codes = tmp["code"].astype(str).tolist()
+    # drop empty/na
+    out: List[str] = []
+    for c in codes:
+        c2 = str(c).strip()
+        if c2 and c2.lower() != "nan":
+            out.append(c2)
+        if len(out) >= top_n:
+            break
+    return out
+
+
+def mean_nextday_return(df_d1: pd.DataFrame, codes: List[str]) -> float:
+    if not codes:
+        return 0.0
+    sub = df_d1[df_d1["code"].isin(codes)].copy()
+    if sub.empty:
+        return 0.0
+    # change_percent should be percent (e.g. 1.23 = +1.23%)
+    sub["change_percent"] = pd.to_numeric(sub["change_percent"], errors="coerce")
+    sub = sub.dropna(subset=["change_percent"])
+    if sub.empty:
+        return 0.0
+    return float(sub["change_percent"].mean() / 100.0)
+
+
+def turnover(prev: Set[str], cur: Set[str]) -> float:
+    # turnover as 1 - overlap_ratio (0..1)
+    if not prev and not cur:
+        return 0.0
+    if not prev:
+        return 1.0
+    if not cur:
+        return 1.0
+    inter = len(prev.intersection(cur))
+    union = len(prev.union(cur))
+    if union == 0:
+        return 0.0
+    overlap = inter / union
+    t = 1.0 - overlap
+    if t < 0:
+        t = 0.0
+    if t > 1:
+        t = 1.0
+    return float(t)
+
+
+@dataclass
+class GateCfg:
+    breadth_field: str
+    breadth_min: float
+
+
+def get_breadth_metric(breadth_hist: Optional[pd.DataFrame], d0: str, field: str) -> float:
+    if breadth_hist is None or breadth_hist.empty:
+        return math.nan
+    if "date" not in breadth_hist.columns:
+        return math.nan
+    sub = breadth_hist[breadth_hist["date"].astype(str) == str(d0)]
+    if sub.empty:
+        return math.nan
+    if field not in sub.columns:
+        return math.nan
+    v = safe_float(sub.iloc[0][field], default=math.nan)
+    return v
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_csv", default=r"data/all_stocks_daily.csv")
+    ap.add_argument("--market_csv", default=r"data/market_snapshot_taiex.csv")
+    ap.add_argument("--breadth_history_csv", default=r"data/breadth_history.csv")
+    ap.add_argument("--out_csv", default=r"reports/portfolio_backtest_v3.csv")
+    ap.add_argument("--out_json", default=r"reports/portfolio_backtest_v3_summary.json")
+    ap.add_argument("--start", default="")
+    ap.add_argument("--end", default="")
+    ap.add_argument("--init_capital", type=float, default=1_000_000.0)
+
+    # portfolio params
+    ap.add_argument("--holdings_on", type=int, default=15)
+    ap.add_argument("--holdings_off", type=int, default=0)
+    ap.add_argument("--cost_bps", type=float, default=25.0)  # 25 bps per 100% turnover
+    ap.add_argument("--breadth_field", default="breadth_ratio")
+    ap.add_argument("--breadth_min", type=float, default=0.0)
+
+    # accept but ignore (compat with weekly_pipeline older versions)
+    ap.add_argument("--threshold", type=float, default=0.0)
+
+    args = ap.parse_args()
+
+    df = read_csv_safe(args.in_csv)
+    need = {"date","code","total_score","change_percent"}
+    if not need.issubset(set(df.columns)):
+        raise ValueError(f"{args.in_csv} must contain: {sorted(list(need))}")
+
+    df["date"] = df["date"].astype(str)
+    df["code"] = df["code"].astype(str)
+
+    dates = sorted(df["date"].unique().tolist())
+    if args.start:
+        dates = [d for d in dates if d >= args.start]
+    if args.end:
+        dates = [d for d in dates if d <= args.end]
+
+    if len(dates) < 2:
+        write_placeholder(args.out_csv, args.out_json, args.init_capital,
+                          note=f"Need >=2 trading dates for portfolio backtest. Found {len(dates)} date(s): {dates[:5]}")
+        return
+
+    # market snapshot
+    mkt = None
+    if args.market_csv and os.path.exists(args.market_csv):
+        mkt = read_csv_safe(args.market_csv)
+        if "date" in mkt.columns:
+            mkt["date"] = mkt["date"].astype(str)
+
+    # breadth history (optional)
+    breadth_hist = None
+    if args.breadth_history_csv and os.path.exists(args.breadth_history_csv):
+        breadth_hist = read_csv_safe(args.breadth_history_csv)
+        if "date" in breadth_hist.columns:
+            breadth_hist["date"] = breadth_hist["date"].astype(str)
+
+    gate = GateCfg(breadth_field=str(args.breadth_field), breadth_min=float(args.breadth_min))
+
+    rows: List[Dict] = []
+    equity = float(args.init_capital)
+    peak = equity
+    prev_hold: Set[str] = set()
+    bar_returns: List[float] = []
+
+    for i in range(len(dates) - 1):
+        d0 = dates[i]
+        d1 = dates[i + 1]
+
+        df0 = df[df["date"] == d0].copy()
+        df1 = df[df["date"] == d1].copy()
+
+        # market gate at d0 (decide exposure for next bar)
+        market_ok = True
+        trend_ok = True
+        risk_mode = "RISK_ON"
+        if mkt is not None and not mkt.empty and "date" in mkt.columns:
+            m0 = mkt[mkt["date"] == d0]
+            if not m0.empty:
+                # accept either bool or string
+                if "market_ok" in m0.columns:
+                    mv = str(m0.iloc[0]["market_ok"]).strip().lower()
+                    market_ok = (mv in ["true","1","yes","y"])
+                if "trend_ok" in m0.columns:
+                    tv = str(m0.iloc[0]["trend_ok"]).strip().lower()
+                    trend_ok = (tv in ["true","1","yes","y"])
+                if "risk_mode" in m0.columns:
+                    risk_mode = str(m0.iloc[0]["risk_mode"]).strip() or ("RISK_ON" if market_ok else "RISK_OFF")
+            else:
+                risk_mode = "RISK_ON" if market_ok else "RISK_OFF"
+        else:
+            risk_mode = "RISK_ON"
+
+        breadth_metric = get_breadth_metric(breadth_hist, d0, gate.breadth_field)
+        breadth_ok = True
+        if not math.isnan(gate.breadth_min):
+            breadth_ok = (not math.isnan(breadth_metric)) and (breadth_metric >= gate.breadth_min)
+
+        # final risk decision at d0
+        risk_on = (market_ok and trend_ok and breadth_ok)
+        risk_mode_final = "RISK_ON" if risk_on else "RISK_OFF"
+
+        # decide holdings at d0
+        if risk_on:
+            cur_list = pick_holdings(df0, int(args.holdings_on))
+        else:
+            cur_list = pick_holdings(df0, int(args.holdings_off)) if int(args.holdings_off) > 0 else []
+
+        cur_hold: Set[str] = set(cur_list)
+
+        # realize return on d1 from holdings chosen at d0
+        gross_r = mean_nextday_return(df1, cur_list) if risk_on else 0.0
+
+        # turnover / cost
+        t = turnover(prev_hold, cur_hold)
+        cost_frac = float(t) * float(args.cost_bps) / 10000.0
+
+        net_r = gross_r - cost_frac
+        equity = equity * (1.0 + net_r)
+
+        if equity > peak:
+            peak = equity
+        dd = 0.0 if peak <= 0 else (peak - equity) / peak
+
+        bar_returns.append(net_r)
+        prev_hold = cur_hold
+
+        rows.append({
+            "date": d1,
+            "prev_date": d0,
+            "risk_mode": risk_mode_final,
+            "market_ok": bool(market_ok),
+            "trend_ok": bool(trend_ok),
+            "breadth_metric": float(breadth_metric) if not math.isnan(breadth_metric) else "",
+            "holdings": len(cur_hold),
+            "turnover": float(t),
+            "gross_return": float(gross_r),
+            "cost_frac": float(cost_frac),
+            "net_return": float(net_r),
+            "equity": float(equity),
+            "drawdown": float(dd),
+        })
+
+    out_df = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
+    out_df.to_csv(args.out_csv, index=False, encoding="utf-8")
+
+    final_equity = float(equity)
+    total_return = (final_equity / float(args.init_capital)) - 1.0
+    max_dd = float(out_df["drawdown"].max()) if not out_df.empty and "drawdown" in out_df.columns else 0.0
+    sharpe = float(compute_sharpe(bar_returns))
+    ann = float(compute_annualized(total_return, len(rows)))
+
+    payload = {
+        "init_capital": float(args.init_capital),
+        "final_equity": final_equity,
+        "total_return": float(total_return),
+        "annualized_return": ann,
+        "max_drawdown": max_dd,
+        "sharpe": sharpe,
+        "bars": int(len(rows)),
+        "breadth_field": gate.breadth_field,
+        "breadth_min": float(gate.breadth_min),
+        "cost_bps": float(args.cost_bps),
+        "holdings_on": int(args.holdings_on),
+    }
+    os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    main()

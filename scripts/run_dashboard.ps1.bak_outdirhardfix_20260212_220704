@@ -1,0 +1,79 @@
+param(
+  [double]$Capital = 300000,
+  [int]$Top = 4000,
+
+  [switch]$NoOpen
+)
+
+function SafeTrim($v){ if($null -eq $v){ return "" } return "$v".Trim() }
+
+function Parse-Date([string]$s){
+  $s = SafeTrim $s
+  if($s -eq ""){ return $null }
+  $ci = [System.Globalization.CultureInfo]::InvariantCulture
+  $styles = [System.Globalization.DateTimeStyles]::None
+  $dt = [datetime]::MinValue
+  if([System.DateTime]::TryParseExact($s, "yyyy-MM-dd", $ci, $styles, [ref]$dt)){ return $dt }
+  $dt2 = [datetime]::MinValue
+  if([System.DateTime]::TryParse($s, $ci, $styles, [ref]$dt2)){ return $dt2 }
+  $dt3 = [datetime]::MinValue
+  if([System.DateTime]::TryParse($s, [ref]$dt3)){ return $dt3 }
+  return $null
+}
+
+function Get-LatestDateFromCsv([string]$path){
+  if(!(Test-Path $path)){ return "" }
+  $rows = Import-Csv $path
+  if(!$rows -or $rows.Count -eq 0){ return "" }
+  if(-not ($rows[0].PSObject.Properties.Name -contains "date")){ return "" }
+
+  $dts = @()
+  foreach($r in $rows){
+    $raw = SafeTrim $r.date
+    if($raw -eq ""){ continue }
+    $dt = Parse-Date $raw
+    if($null -eq $dt){ continue }
+    $dts += $dt
+  }
+  if(!$dts -or $dts.Count -eq 0){ return "" }
+  return (($dts | Sort-Object | Select-Object -Last 1).ToString("yyyy-MM-dd"))
+}
+
+Write-Host "=== RUN DASHBOARD ===" -ForegroundColor Cyan
+
+# 0) Ensure scripts exist
+if(!(Test-Path ".\scripts\build_dashboard_html.ps1")){
+  throw "Missing: .\scripts\build_dashboard_html.ps1"
+}
+
+# 1) Show dates (visibility)
+.\scripts\build_dashboard_html.ps1 -ListDates
+
+# 2) Pick latest date from decisions first, else daily
+$decPath = ".\data\all_stocks_decisions.csv"
+$dailyPath = ".\data\all_stocks_daily.csv"
+
+$latestDec = Get-LatestDateFromCsv $decPath
+$latestDaily = Get-LatestDateFromCsv $dailyPath
+
+$useDate = ""
+if($latestDec -ne ""){ $useDate = $latestDec }
+elseif($latestDaily -ne ""){ $useDate = $latestDaily }
+else { throw "No usable date found in decisions/daily CSV." }
+
+Write-Host ("[INFO] UseDate = {0}" -f $useDate) -ForegroundColor Green
+Write-Host ("[INFO] Capital  = {0}" -f $Capital) -ForegroundColor DarkGray
+Write-Host ("[INFO] Top      = {0}" -f $Top) -ForegroundColor DarkGray
+
+# 3) Build HTML
+.\scripts\build_dashboard_html.ps1 -Date $useDate -Capital $Capital -Top $Top
+
+# 4) Open latest
+$latest = Get-ChildItem .\reports\tw_dashboard_*.html | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if($null -eq $latest){ throw "No report produced under .\reports" }
+
+$latest | Format-Table Name,LastWriteTime,Length -AutoSize
+
+if(-not $NoOpen){
+  Start-Process $latest.FullName
+}

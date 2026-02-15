@@ -1,0 +1,187 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class ReportController extends Controller
+{
+    private function scoreAction(int $score): array
+    {
+        // 規則型分段：用於視覺提示（非投資建議）
+        if ($score >= 75) return ['label' => '偏買進/加碼', 'zone' => 'buy'];
+        if ($score >= 60) return ['label' => '小額試單（偏買）', 'zone' => 'buy-lite'];
+        if ($score >= 40) return ['label' => '觀望/持有', 'zone' => 'hold'];
+        return ['label' => '偏賣出/避開', 'zone' => 'sell'];
+    }
+
+    private function hasWarning(array $row, string $needle): bool
+    {
+        $warnings = $row['warnings'] ?? [];
+        if (!is_array($warnings)) return false;
+        foreach ($warnings as $w) {
+            if (is_string($w) && mb_strpos($w, $needle) !== false) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 資金分配 v1：
+     * - 先挑 Top N（預設 5）
+     * - 盡量避開「低流動性」（不足才補回）
+     * - 權重依 score_total 正規化
+     * - 單檔上限 35%（避免押單檔）
+     */
+    private function buildAllocation(array $top20, int $capital, int $pick = 5): array
+    {
+        $capital = max(0, $capital);
+        $pick = max(3, min(8, $pick));
+
+        // 1) 先把候選整理好（必須有 close）
+        $candidates = [];
+        foreach ($top20 as $r) {
+            $close = (float)($r['signals']['close'] ?? $r['close'] ?? 0);
+            // 我們目前 top20 json 裡沒有 close，因此改從 daily_bars 取得是 v2
+            // v1 先用 daily_bars 的 close 不在這裡：所以在 Blade 用表格不算股數也行。
+            // 但你目前 top20 JSON 沒帶 close，我們先用 0 代表未知，仍能做「金額分配」。
+            $score = (int)($r['score_total'] ?? 0);
+            $candidates[] = [
+                'symbol' => (string)($r['symbol'] ?? ''),
+                'name' => (string)($r['name'] ?? ''),
+                'bucket' => (string)($r['bucket'] ?? ''),
+                'score_total' => $score,
+                'warnings' => $r['warnings'] ?? [],
+                'low_liquidity' => $this->hasWarning($r, '低流動性'),
+            ];
+        }
+
+        // 2) 排序：分數高的優先
+        usort($candidates, fn($a, $b) => $b['score_total'] <=> $a['score_total']);
+
+        // 3) 先挑「非低流動性」
+        $primary = array_values(array_filter($candidates, fn($x) => !$x['low_liquidity']));
+        $selected = array_slice($primary, 0, $pick);
+
+        // 不夠就補回（允許低流動性）
+        if (count($selected) < $pick) {
+            $need = $pick - count($selected);
+            $selectedSymbols = array_flip(array_map(fn($x) => $x['symbol'], $selected));
+            $fallback = [];
+            foreach ($candidates as $x) {
+                if (!isset($selectedSymbols[$x['symbol']])) $fallback[] = $x;
+            }
+            $selected = array_merge($selected, array_slice($fallback, 0, $need));
+        }
+
+        // 4) 權重：score 正規化
+        $sum = array_sum(array_map(fn($x) => max(0, (int)$x['score_total']), $selected));
+        if ($sum <= 0) {
+            $w = 1 / max(1, count($selected));
+            foreach ($selected as &$x) { $x['weight'] = $w; }
+            unset($x);
+        } else {
+            foreach ($selected as &$x) {
+                $x['weight'] = max(0, (int)$x['score_total']) / $sum;
+            }
+            unset($x);
+        }
+
+        // 5) 單檔上限 35%（簡單截斷再重新分配剩餘）
+        $cap = 0.35;
+        $fixed = [];
+        $free = [];
+        $fixedSum = 0.0;
+        foreach ($selected as $x) {
+            if ($x['weight'] > $cap) {
+                $x['weight'] = $cap;
+                $fixed[] = $x;
+                $fixedSum += $cap;
+            } else {
+                $free[] = $x;
+            }
+        }
+        $remain = max(0.0, 1.0 - $fixedSum);
+        $freeSum = array_sum(array_map(fn($x) => (float)$x['weight'], $free));
+        if ($freeSum > 0) {
+            foreach ($free as &$x) { $x['weight'] = $x['weight'] / $freeSum * $remain; }
+            unset($x);
+        } else {
+            // 都被 cap 了（極端），平均分配剩餘
+            $n = max(1, count($fixed));
+            foreach ($fixed as &$x) { $x['weight'] = 1 / $n; }
+            unset($x);
+        }
+        $selected = array_merge($fixed, $free);
+
+        // 6) 轉成「建議金額」
+        foreach ($selected as &$x) {
+            $x['suggest_amount'] = (int) round($capital * (float)$x['weight']);
+        }
+        unset($x);
+
+        // 7) 重新依建議金額排序（大→小）
+        usort($selected, fn($a, $b) => $b['suggest_amount'] <=> $a['suggest_amount']);
+
+        $allocated = array_sum(array_map(fn($x) => (int)$x['suggest_amount'], $selected));
+        $cashLeft = max(0, $capital - $allocated);
+
+        return [
+            'pick' => $pick,
+            'capital' => $capital,
+            'allocated' => $allocated,
+            'cash_left' => $cashLeft,
+            'items' => $selected,
+        ];
+    }
+
+    public function today()
+    {
+        $date = DB::table('daily_reports')
+            ->orderByDesc('date')
+            ->value('date');
+
+        if (!$date) abort(404, 'No report found');
+
+        return redirect()->route('report.show', ['date' => $date]);
+    }
+
+    public function show(Request $request, string $date)
+    {
+        $report = DB::table('daily_reports')->where('date', $date)->first();
+        if (!$report) abort(404, 'Report not found');
+
+        $top20 = json_decode($report->top20, true) ?: [];
+
+        // Top1 分數
+        $top1Score = isset($top20[0]['score_total']) ? (int)$top20[0]['score_total'] : 0;
+
+        // Top20 平均分數
+        $scores = array_map(fn($r) => (int)($r['score_total'] ?? 0), $top20);
+        $avgScore = count($scores) ? (int) round(array_sum($scores) / count($scores)) : 0;
+
+        $top1Action = $this->scoreAction($top1Score);
+        $avgAction  = $this->scoreAction($avgScore);
+
+        // 資金分配 v1（由 query 參數帶入）
+        $capital = (int) $request->query('capital', 0);
+        $pick    = (int) $request->query('pick', 5);
+        $allocation = null;
+        if ($capital > 0) {
+            $allocation = $this->buildAllocation($top20, $capital, $pick);
+        }
+
+        return view('report.show', [
+            'date' => $report->date,
+            'top20' => $top20,
+            'ai_comment' => $report->ai_comment,
+
+            'top1_score' => $top1Score,
+            'avg_score' => $avgScore,
+            'top1_action' => $top1Action,
+            'avg_action' => $avgAction,
+
+            'allocation' => $allocation,
+        ]);
+    }
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TW Dashboard</title>
+<style>:root{
+  --bg:#0b1220; --card:#111a2d; --muted:#9fb0d0; --text:#e8efff; --line:#223055;
+  --pos:#5eead4; --neg:#fb7185; --accent:#60a5fa;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:1200px;margin:0 auto;padding:18px}
+.h1{font-size:20px;font-weight:700;margin:0 0 10px 0}
+.small{color:var(--muted);font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px}
+.kpi{grid-column:span 3}
+.kpi .v{font-size:18px;font-weight:700}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{border-bottom:1px solid var(--line);padding:8px 6px;font-size:12px}
+.table th{color:var(--muted);text-align:left;font-weight:600}
+.pos{color:var(--pos)}
+.neg{color:var(--neg)}
+.muted{color:var(--muted)}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted);font-size:12px}
+.section{grid-column:span 6}</style>
+</head>
+<body>
+  <div class="container">
+    <div class="h1">台股盤口總覽（）</div>
+    <div class="sub">資料來源：daily　|　指數檔：n/a　|　Top門檻：4,000　|　資金：300,000</div>
+
+    <div class="grid">
+      <div class="card span6">
+        <div class="kpi">
+          <div class="k"><div class="t">加權指數</div><div class="v ">n/a</div></div>
+          <div class="k"><div class="t">櫃買指數</div><div class="v ">n/a</div></div>
+          <div class="k"><div class="t">市場廣度</div><div class="v"></div></div>
+          <div class="k"><div class="t">平均漲跌幅</div><div class="v "></div></div>
+        </div>
+        <div class="note">
+          <span class="badge">市場狀態：</span>
+          <div style="margin-top:8px">建議：</div>
+        </div>
+      </div>
+
+      <div class="card span6">
+        <div style="font-weight:800;margin-bottom:8px">類股熱度（Top 12）</div>
+        <table>
+          <thead><tr><th>類股</th><th>家數</th><th>平均漲跌</th></tr></thead>
+          <tbody>
+            <tr><td colspan='4'><small>no sector data</small></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card span12">
+        <div style="font-weight:800;margin-bottom:8px">高分/強勢清單（最多 40 筆）</div>
+        <table>
+          <thead><tr><th>代碼</th><th>名稱</th><th>類股</th><th>漲跌幅</th><th style="text-align:right">總分</th></tr></thead>
+          <tbody>
+            <tr><td colspan='4'><small>no picks</small></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="footer">Generated: 2026-02-12 22:19:16</div>
+  </div>
+</body>
+</html>

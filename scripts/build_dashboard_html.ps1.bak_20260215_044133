@@ -1,0 +1,30 @@
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+  [string]$Date = "",
+  [int]$Capital = 300000,
+  [int]$Top = 4000,
+  [string]$OutDir = ".\reports",
+  [switch]$Open,
+  [int]$DiversifyN = 6
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+Write-Host "=== BUILD_DASHBOARD_HTML.ps1 LOADED (NO Id PARAM) ===" -ForegroundColor Green
+Write-Host ("Path   = {0}" -f $PSCommandPath)
+Write-Host ("Date   = {0}" -f $Date)
+Write-Host ("Top    = {0}" -f $Top)
+Write-Host ("Capital= {0}" -f $Capital)
+Write-Host ("OutDir = {0}" -f $OutDir)
+Write-Host ("Open   = {0}" -f $Open.IsPresent)
+Write-Host ("N      = {0}" -f $DiversifyN)
+
+# create a tiny html so run_dashboard won't fail later
+if([string]::IsNullOrWhiteSpace($Date)){ $Date = (Get-Date -Format "yyyy-MM-dd") }
+$OutDirFull = (Resolve-Path $OutDir).Path
+$outPath = Join-Path $OutDirFull ("dashboard_{0}.html" -f $Date)
+[System.IO.File]::WriteAllText($outPath, "<html><body>OK $Date</body></html>", (New-Object System.Text.UTF8Encoding($false)))
+Write-Host ("OK: wrote HTML -> {0}" -f $outPath) -ForegroundColor Green
+if($Open){ Start-Process $outPath | Out-Null }

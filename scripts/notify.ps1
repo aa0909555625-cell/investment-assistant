@@ -1,32 +1,33 @@
-﻿Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
-
 param(
-  [string]$Title   = "Investment Assistant",
-  [string]$Message = "Weekly task failed. Please check logs.",
-  [int]$TimeoutSec = 0
+  [Parameter(Mandatory=$false)]
+  [string]$Title = "Investment Assistant",
+
+  [Parameter(Mandatory=$false)]
+  [string]$Message = "Task completed.",
+
+  [Parameter(Mandatory=$false)]
+  [ValidateSet("Info","Warn","Error")]
+  [string]$Level = "Info"
 )
 
-function Show-Popup {
-  param([string]$T,[string]$M,[int]$Sec)
+$ErrorActionPreference = "Stop"
 
+function Try-Toast([string]$t, [string]$m) {
   try {
-    # 64 = Info icon, 16 = Error icon (we'll use Info here)
-    $ws = New-Object -ComObject WScript.Shell
-    [void]$ws.Popup($M, $Sec, $T, 64)
-    return $true
-  } catch {
-    return $false
-  }
+    if (Get-Module -ListAvailable -Name BurntToast) {
+      Import-Module BurntToast -ErrorAction Stop | Out-Null
+      New-BurntToastNotification -Text $t, $m | Out-Null
+      return $true
+    }
+  } catch { }
+  return $false
 }
 
-# Ensure non-empty message (avoid msg.exe-like "invalid parameter" issues)
-if ([string]::IsNullOrWhiteSpace($Message)) { $Message = "(no message)" }
+$tag = "[{0}]" -f $Level.ToUpper()
+$line = "{0} {1} {2}" -f $tag, $Title, $Message
 
-$ok = Show-Popup -T $Title -M $Message -Sec $TimeoutSec
-if (-not $ok) {
-  # Fallback: write to host only
-  Write-Host ("[{0}] {1}" -f $Title, $Message)
+if (-not (Try-Toast $Title $line)) {
+  if ($Level -eq "Error") { Write-Host $line -ForegroundColor Red }
+  elseif ($Level -eq "Warn") { Write-Host $line -ForegroundColor Yellow }
+  else { Write-Host $line -ForegroundColor Cyan }
 }
-
-exit 0

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>台股 Top20 日報｜{{ $date }}</title>
+    <style>
+        body { font-family: system-ui, -apple-system; margin: 24px; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 24px; }
+        th, td { border: 1px solid #ddd; padding: 8px; font-size: 14px; }
+        th { background: #f5f5f5; }
+        h1, h2 { margin-top: 24px; }
+        pre { background: #111; color: #eee; padding: 16px; white-space: pre-wrap; }
+        .warn { color: #b00020; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+<h1>台股 Top20 日報</h1>
+<p>日期：<strong>{{ $date }}</strong></p>
+
+<h2>Top 20 股票</h2>
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>代號</th>
+            <th>名稱</th>
+            <th>分類</th>
+            <th>總分</th>
+            <th>警示</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach ($top20 as $i => $row)
+        <tr>
+            <td>{{ $i + 1 }}</td>
+            <td>{{ $row['symbol'] }}</td>
+            <td>{{ $row['name'] }}</td>
+            <td>{{ $row['bucket'] }}</td>
+            <td>{{ $row['score_total'] }}</td>
+            <td class="warn">
+                {{ isset($row['warnings']) ? implode('、', $row['warnings']) : '' }}
+            </td>
+        </tr>
+        @endforeach
+    </tbody>
+</table>
+
+<h2>系統解讀（v1 規則型）</h2>
+<pre>{{ $ai_comment }}</pre>
+
+</body>
+</html>

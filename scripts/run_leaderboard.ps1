@@ -1,4 +1,4 @@
-﻿Write-Host "=== Investment Assistant :: Phase ⑥ Leaderboard ==="
+Write-Host "=== Investment Assistant :: Phase ⑥ Leaderboard ==="
 
 $IN  = "data/metrics_sweep.csv"
 

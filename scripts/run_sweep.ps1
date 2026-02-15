@@ -1,4 +1,4 @@
-﻿Write-Host "=== Investment Assistant :: Phase ⑤ Strategy Sweep ==="
+Write-Host "=== Investment Assistant :: Phase ⑤ Strategy Sweep ==="
 
 $PY = "python"
 $MAIN = "src.main"
